@@ -16,7 +16,7 @@ _STATUS_ICONS = {
 }
 
 _TASK_DICT_FIELDS = (
-    "id", "title", "body", "assignee", "status", "priority", "tenant",
+    "id", "title", "body", "assignee", "idempotency_key", "status", "priority", "tenant",
     "workspace_kind", "workspace_path", "branch_name", "project_id",
     "created_by", "created_at", "started_at", "completed_at", "result",
     "skills", "max_runtime_seconds", "max_retries", "model_override", "provider_override",

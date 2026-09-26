@@ -902,7 +902,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # keeps re-running here cheap and correct on fresh DBs.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tenant ON tasks(tenant)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)")
+    # A board has its own database. UNIQUE includes archived rows: replay must
+    # never silently become a new task after archival. SQLite permits NULLs.
+    # Existing duplicate non-NULL keys raise here; do not pick a winner or
+    # mutate historical tasks during migration.
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idempotency_unique ON tasks(idempotency_key) WHERE idempotency_key IS NOT NULL")
+    conn.execute("DROP INDEX IF EXISTS idx_tasks_idempotency")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)")
 
     # task_events.run_id back-fills as NULL for historical events (they predate

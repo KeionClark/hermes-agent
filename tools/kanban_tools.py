@@ -394,7 +394,7 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 
 
 _TASK_FIELDS = tuple(
-    "id title body assignee status tenant priority workspace_kind workspace_path created_by "
+    "id title body assignee idempotency_key status tenant priority workspace_kind workspace_path created_by "
     "created_at started_at completed_at result current_run_id model_override "
     "provider_override completion_contract last_failure_error".split())
 _TASK_SUMMARY_FIELDS = tuple(
