@@ -179,7 +179,7 @@ _SPECS = [
         _arg("--triage", action="store_true",
              help="Park in triage — a specifier will flesh out the spec and promote to todo"),
         _arg("--idempotency-key",
-             help="Dedup key. If a non-archived task with this key exists, "
+             help="Dedup key. If a task with this key exists (including archived tasks), "
                   "its id is returned instead of creating a duplicate."),
         _arg("--max-runtime",
              help="Per-task runtime cap. Accepts seconds (300) or durations (90s, "
