@@ -1037,6 +1037,21 @@ def _handle_create(args: dict, **kw) -> str:
     assignee = args.get("assignee")
     _check(assignee, "assignee is required — name the profile that should execute this "
                      "task (the dispatcher will only spawn tasks with an assignee)")
+    # Warn (not hard-reject) when the assignee doesn't match an installed profile:
+    # the dispatcher silently drops cards with unknown assignees (they sit in ready
+    # forever). A warning lets external worker pools still create cards while surfacing
+    # the mismatch loudly enough to catch typos and role-name confusion.
+    _assignee_warning = None
+    try:
+        from hermes_cli.profiles import list_profile_names, profile_exists
+        if not profile_exists(str(assignee)):
+            _assignee_warning = (
+                f"assignee profile {assignee!r} is not installed on this host — "
+                f"the dispatcher will silently skip this task unless that profile is created. "
+                f"Installed profiles: {', '.join(list_profile_names())}. "
+                f"If this is a typo, the task will rot in ready forever.")
+    except Exception:
+        pass  # profile check unavailable — continue without the warning
     # Workspace sharing is always explicit: omitted fields mean a fresh scratch workspace
     # even for a dispatcher-spawned creator (reusing the parent's path would let a child
     # mutate review evidence or race its checkout). Project identity is the one safe thing
@@ -1088,8 +1103,11 @@ def _handle_create(args: dict, **kw) -> str:
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
+        extra: dict[str, Any] = {}
+        if _assignee_warning:
+            extra["assignee_warning"] = _assignee_warning
         return _ok(task_id=new_tid, **landed, **gate,
-                   subscribed=_maybe_auto_subscribe(conn, new_tid))
+                   subscribed=_maybe_auto_subscribe(conn, new_tid), **extra)
 
 
 def _resolve_notify_target() -> Optional[dict[str, Any]]:

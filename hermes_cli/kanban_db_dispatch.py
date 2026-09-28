@@ -2040,6 +2040,26 @@ def _dispatch_lane_task(
     profile_exists = _profile_exists_fn()
     if profile_exists is not None and not profile_exists(assignee):
         result.skipped_nonspawnable.append(task_id)
+        # Emit a one-time event so the notifier can deliver the stranded signal
+        # to subscribed chats. Rate-limited: only when no such event exists in
+        # the last 30 minutes for this task, so the event log stays clean.
+        if not dry_run:
+            _STRANDED_COOLDOWN_SECONDS = 30 * 60
+            try:
+                latest = conn.execute(
+                    "SELECT MAX(created_at) AS ts FROM task_events "
+                    "WHERE task_id = ? AND kind = 'stranded_nonspawnable'",
+                    (task_id,),
+                ).fetchone()
+                last_ts = int(latest["ts"] or 0) if latest else 0
+                if int(time.time()) - last_ts >= _STRANDED_COOLDOWN_SECONDS:
+                    with _kb.write_txn(conn):
+                        _kb._append_event(conn, task_id, "stranded_nonspawnable", {
+                            "assignee": assignee,
+                            "reason": f"assignee {assignee!r} is not an installed profile",
+                        })
+            except Exception:
+                pass  # best-effort; never block the dispatch tick
         return False
     # Per-profile cap: one profile's local model / API quota / browser pool
     # must not be overwhelmed by a fan-out even with global headroom.
@@ -2468,8 +2488,10 @@ def _rotate_worker_log(
 
 
 def _module_hermes_argv() -> list[str]:
-    """Interpreter-bound Hermes CLI invocation (``hermes_cli.main`` is the
-    console-script target — there is no top-level ``hermes`` package)."""
+    """Use the install shim so isolated workers bootstrap Hermes package paths."""
+    shim = Path(__file__).resolve().parents[1] / ".hermes" / "bin" / "hermes"
+    if shim.is_file() and os.access(shim, os.X_OK):
+        return [str(shim)]
     return [sys.executable, "-m", "hermes_cli.main"]
 
 

@@ -382,6 +382,17 @@ def _cmd_create(args: argparse.Namespace) -> int:
         _print_json(_task_to_dict(task))
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
+        # Warn when the assignee is not an installed profile — the dispatcher
+        # will silently skip the card, leaving it stranded in ready forever.
+        if task and task.assignee:
+            from hermes_cli.profiles import profile_exists
+            if not profile_exists(task.assignee):
+                print(
+                    f"\n⚠  assignee {task.assignee!r} is not an installed profile — "
+                    f"the dispatcher will silently skip this task. "
+                    f"Use `hermes profile list` to see installed profiles.",
+                    file=sys.stderr,
+                )
         # Warn only for ready+assigned tasks that would sit without a dispatcher (triage/todo idle
         # by design, unassigned can't dispatch); skipped under --json so stdout stays parseable.
         if task.status == "ready" and task.assignee:

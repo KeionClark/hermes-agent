@@ -33,7 +33,7 @@ def _kbn():
 # "status" covers dashboard drag-drop and `_set_status_direct()`.
 # ``review_requested`` wakes the origin like a block but is not one;
 # the task is not archived so later review cycles keep notifying.
-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "stranded_nonspawnable")
 # Kinds that hand a decision back to the origin, which must take a turn.
 # status/archived/unblocked are bookkeeping.
 _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
@@ -41,7 +41,7 @@ _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "revie
 
 def diagnostic_event(ev) -> bool:
     """Infrastructure attention is distinct from an explicit owner decision."""
-    if ev.kind in {"crashed", "timed_out", "gave_up"}:
+    if ev.kind in {"crashed", "timed_out", "gave_up", "stranded_nonspawnable"}:
         return True
     if ev.kind in {"blocked", "block_loop_detected"}:
         return (ev.payload or {}).get("kind") != "needs_input"
@@ -468,6 +468,10 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     "review_requested": _fmt_review_requested,
     "changes_requested": _fmt_changes_requested,
     "block_loop_detected": _fmt_block_loop_detected,
+    "stranded_nonspawnable": lambda ev, n: (
+        f"⚠ {n.head} stranded: assignee {(_payload(ev, 'assignee') or '?')!r} is not an installed profile — "
+        f"reassign it with `hermes kanban reassign {n.task_id} <profile>`.", None, None,
+    ),
 }
 
 

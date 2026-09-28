@@ -417,6 +417,18 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
         task_id = kanban_db.create_task(conn, created_by="dashboard", board=board, **payload.model_dump())
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
+        # Warn when the assignee is not an installed profile — the dispatcher
+        # will silently skip the card, leaving it stranded in ready forever.
+        if task and task.assignee:
+            try:
+                from hermes_cli.profiles import profile_exists
+                if not profile_exists(task.assignee):
+                    body["assignee_warning"] = (
+                        f"assignee {task.assignee!r} is not an installed profile — "
+                        f"the dispatcher will silently skip this task"
+                    )
+            except Exception:
+                pass  # probe failure must never block the create itself
         # Dispatcher-presence warning so the UI can banner a ready+assigned task that would
         # otherwise sit idle (no gateway / dispatch_in_gateway=false); triage/todo are expected
         # to wait, unassigned tasks can't dispatch anyway. Probe the request's active home: the
@@ -550,6 +562,31 @@ class _StatusRejected(Exception):
 
 
 _RUNNING_DIRECT_MSG = "Cannot set status to 'running' directly; use the dispatcher/claim path"
+class RemoteClaimBody(BaseModel):
+    claimer: str
+    ttl_seconds: Optional[int] = Field(default=1800, ge=30, le=86400)
+
+
+@router.post("/tasks/{task_id}/claim")
+def claim_task_endpoint(task_id: str, payload: RemoteClaimBody, board: Optional[str] = Query(None)):
+    """Atomically claim a ready task for a remote worker node."""
+    with _board_conn(board) as (board, conn):
+        task = kanban_db.claim_task(conn, task_id, ttl_seconds=payload.ttl_seconds, claimer=payload.claimer)
+        if task is None:
+            raise HTTPException(status_code=409, detail=f"task {task_id} is no longer ready")
+        return {"task": _task_dict(task)}
+
+
+@router.post("/tasks/{task_id}/heartbeat")
+def heartbeat_task_endpoint(task_id: str, payload: RemoteClaimBody, board: Optional[str] = Query(None)):
+    """Extend a remote worker claim without exposing the SQLite database."""
+    with _board_conn(board) as (board, conn):
+        ok = kanban_db.heartbeat_claim(conn, task_id, ttl_seconds=payload.ttl_seconds, claimer=payload.claimer)
+        if not ok:
+            raise HTTPException(status_code=409, detail=f"claim for {task_id} is no longer owned")
+        task = kanban_db.get_task(conn, task_id)
+        return {"task": _task_dict(task) if task else None}
+
 
 
 def _drag_to(conn, task_id: str, s: str) -> bool:
@@ -1021,7 +1058,19 @@ def reassign_task_endpoint(task_id: str, payload: ReassignBody, board: Optional[
             raise _conflict(
                 f"cannot reassign {task_id}: unknown id, or still "
                 "running (pass reclaim_first=true to release the claim first)")
-        return {"ok": True, "task_id": task_id, "assignee": payload.profile or None}
+        result: dict[str, Any] = {"ok": True, "task_id": task_id, "assignee": payload.profile or None}
+        # Warn when the new assignee is not an installed profile.
+        if payload.profile:
+            try:
+                from hermes_cli.profiles import profile_exists
+                if not profile_exists(payload.profile):
+                    result["assignee_warning"] = (
+                        f"assignee {payload.profile!r} is not an installed profile — "
+                        f"the dispatcher will silently skip this task"
+                    )
+            except Exception:
+                pass
+        return result
 
 
 # Estimate: rough token/complexity read via the auxiliary model. NOT a dollar cost.
