@@ -79,6 +79,11 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
+# ``mac`` is reserved for the explicitly invoked Mac overflow worker, which
+# claims through the server-board client rather than this dispatcher. Imported
+# ``legacy-mac`` remains server-owned migration provenance.
+_MAC_OVERFLOW_TENANT = "mac"
+
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
@@ -1755,8 +1760,9 @@ def dispatch_profile_allowlist_summary() -> str:
 def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
-        "WHERE status = ? AND assignee IS NOT NULL AND claim_lock IS NULL",
-        (status,),
+        "WHERE status = ? AND assignee IS NOT NULL AND claim_lock IS NULL "
+        "AND LOWER(TRIM(COALESCE(tenant, ''))) != ?",
+        (status, _MAC_OVERFLOW_TENANT),
     ).fetchall()
     if not rows:
         return False
@@ -2265,11 +2271,18 @@ def _tick_spawn_budget(
 
 
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
-    """Unclaimed rows of one lane in dispatch order."""
+    """Unclaimed server-owned rows of one lane in dispatch order.
+
+    ``mac`` is reserved for the explicitly invoked Mac overflow worker.
+    Keeping it out of both lane queries and spawnability telemetry prevents
+    the server from claiming it or reporting it as a stalled server queue.
+    """
     return conn.execute(
         "SELECT id, assignee FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
+        "AND LOWER(TRIM(COALESCE(tenant, ''))) != ? "
+        "ORDER BY priority DESC, created_at ASC",
+        (_MAC_OVERFLOW_TENANT,),
     ).fetchall()
 
 

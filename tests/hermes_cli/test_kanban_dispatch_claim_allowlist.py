@@ -78,6 +78,71 @@ def test_unset_allowlist_keeps_default_claimable(kanban_home, all_assignees_spaw
     assert res.skipped_nonspawnable == []
 
 
+def test_mac_overflow_tenant_is_not_server_dispatchable(
+    kanban_home, all_assignees_spawnable,
+):
+    """The Mac-only card stays ready for the overflow worker, while imported,
+    ordinary and unscoped cards remain available to the server dispatcher."""
+    with kbc.connect() as conn:
+        mac = kb.create_task(conn, title="Mac overflow", assignee="default", tenant="mac")
+        legacy = kb.create_task(
+            conn, title="Imported Mac overflow", assignee="default", tenant="legacy-mac",
+        )
+        ordinary = kb.create_task(
+            conn, title="Server task", assignee="default", tenant="suitegrowth",
+        )
+        unscoped = kb.create_task(conn, title="Unscoped server task", assignee="default")
+
+        assert kbd.has_spawnable_ready(conn) is True
+        res = kbd.dispatch_once(conn, dry_run=True)
+
+        assert [task_id for task_id, _assignee, _workspace in res.spawned] == [
+            legacy, ordinary, unscoped,
+        ]
+        assert kb.get_task(conn, mac).status == "ready"
+
+
+def test_mac_overflow_only_ready_work_does_not_keep_server_dispatch_wakeable(
+    kanban_home, all_assignees_spawnable,
+):
+    with kbc.connect() as conn:
+        kb.create_task(conn, title="Mac overflow", assignee="default", tenant="mac")
+        assert kbd.has_spawnable_ready(conn) is False
+
+
+def test_mac_overflow_tenant_is_not_server_review_dispatchable(
+    kanban_home, all_assignees_spawnable,
+):
+    with kbc.connect() as conn:
+        mac = kb.create_task(conn, title="Mac overflow", assignee="default", tenant="mac")
+        legacy = kb.create_task(
+            conn, title="Imported Mac overflow", assignee="default", tenant="legacy-mac",
+        )
+        ordinary = kb.create_task(
+            conn, title="Server task", assignee="default", tenant="suitegrowth",
+        )
+        unscoped = kb.create_task(conn, title="Unscoped server task", assignee="default")
+        for task_id in (mac, legacy, ordinary, unscoped):
+            assert kb.request_review(conn, task_id, summary="Ready to review") is True
+
+        assert kbd.has_spawnable_review(conn) is True
+        res = kbd.dispatch_once(conn, dry_run=True)
+
+        assert [task_id for task_id, _assignee, _workspace in res.spawned] == [
+            legacy, ordinary, unscoped,
+        ]
+        assert kb.get_task(conn, mac).status == "review"
+
+
+def test_mac_overflow_only_review_work_does_not_keep_server_dispatch_wakeable(
+    kanban_home, all_assignees_spawnable,
+):
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="Mac overflow", assignee="default", tenant="mac")
+        assert kb.request_review(conn, task_id, summary="Ready to review") is True
+        assert kbd.has_spawnable_review(conn) is False
+
+
 @pytest.mark.parametrize("value", ["", None], ids=["empty_string", "bare_key"])
 def test_present_blank_or_null_allowlist_skips_all_cards(
     kanban_home, all_assignees_spawnable, value, caplog,
