@@ -1108,6 +1108,165 @@ class TestBoardSnapshotAdapter:
         assert results[0].measurement.value == 2.0  # 2 blocked
         conn.close()
 
+    def test_blocked_never_exceeds_non_archived(self):
+        """Invariant: blocked_count <= non_archived_count for any board state."""
+        conn = self._make_board_db()
+        # All blocked.
+        for i in range(5):
+            self._insert_task(conn, f"t{i}", "blocked")
+
+        snap = snapshot_board_counts(conn)
+        assert snap.blocked_count <= snap.non_archived_count
+        assert snap.blocked_count == 5
+        assert snap.non_archived_count == 5
+
+        # Add non-blocked tasks.
+        self._insert_task(conn, "t10", "running")
+        self._insert_task(conn, "t11", "done")
+        snap2 = snapshot_board_counts(conn)
+        assert snap2.blocked_count <= snap2.non_archived_count
+        assert snap2.blocked_count == 5
+        assert snap2.non_archived_count == 7
+        conn.close()
+
+    def test_snapshot_atomic_under_wal_interleaving(self):
+        """Deterministic two-connection WAL race: blocked_count must never
+        exceed non_archived_count.
+
+        Reproduces the exact P0b defect: the old code performed two separate
+        SELECTs on an autocommit connection, allowing a WAL writer to inject
+        rows between them.  The fixed code uses a single-statement aggregate
+        that cannot be split.
+
+        Scenario:
+          Before: 1 task ('ready'), counts = (1, 0)
+          Injected between the two (old) SELECT points:
+            DELETE the 'ready' task, INSERT 2 'blocked' tasks
+          After: 2 tasks ('blocked', 'blocked'), counts = (2, 2)
+
+        Old code returned (1, 2) — impossible: blocked > total.
+        Fixed code must return either (1, 0) or (2, 2) — a valid snapshot.
+        """
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+
+        # Reader connection — autocommit, matching canonical kanban connection.
+        reader = sqlite3.connect(tmp.name, isolation_level=None)
+        reader.row_factory = sqlite3.Row
+        reader.execute("PRAGMA journal_mode=WAL")
+
+        # Writer connection — separate WAL reader/writer.
+        writer = sqlite3.connect(tmp.name, isolation_level=None)
+        writer.execute("PRAGMA journal_mode=WAL")
+
+        # Set up the board: one 'ready' task.
+        reader.execute(
+            "CREATE TABLE tasks ("
+            " id TEXT PRIMARY KEY,"
+            " title TEXT,"
+            " status TEXT NOT NULL,"
+            " assignee TEXT,"
+            " created_at INTEGER NOT NULL"
+            ")"
+        )
+        reader.execute(
+            "INSERT INTO tasks (id, title, status, assignee, created_at) "
+            "VALUES ('t3', 'Task t3', 'ready', 'builder', 1000)"
+        )
+
+        # Arm the trace callback to inject writes via the writer connection
+        # when the reader executes any statement mentioning 'blocked'.
+        # With the OLD two-statement code, this fires between the SELECTs;
+        # with the NEW single-statement code, the injection cannot split
+        # the read because both counts come from one implicit transaction.
+        triggered = False
+
+        def inject_race(statement):
+            nonlocal triggered
+            if not triggered and "'blocked'" in statement:
+                triggered = True
+                writer.execute("DELETE FROM tasks WHERE id='t3'")
+                writer.execute(
+                    "INSERT INTO tasks (id, title, status, assignee, created_at) "
+                    "VALUES ('t4', 'Task t4', 'blocked', 'builder', 1001)"
+                )
+                writer.execute(
+                    "INSERT INTO tasks (id, title, status, assignee, created_at) "
+                    "VALUES ('t5', 'Task t5', 'blocked', 'builder', 1002)"
+                )
+
+        reader.set_trace_callback(inject_race)
+        snap = snapshot_board_counts(reader)
+        reader.set_trace_callback(None)
+
+        # The trace callback did fire (it matched 'blocked' in the query).
+        assert triggered, "trace callback must have been triggered"
+
+        # The invariant: blocked <= non_archived in any valid snapshot.
+        assert snap.blocked_count <= snap.non_archived_count, (
+            f"impossible snapshot: blocked={snap.blocked_count} > "
+            f"non_archived={snap.non_archived_count}"
+        )
+
+        # Must be one of the two valid board states, not the old impossible (1,2).
+        valid_states = {(1, 0), (2, 2)}
+        actual = (snap.non_archived_count, snap.blocked_count)
+        assert actual in valid_states, (
+            f"snapshot {actual} is not a valid board state; "
+            f"expected one of {valid_states}"
+        )
+
+        reader.close()
+        writer.close()
+
+    def test_snapshot_under_caller_owned_transaction(self):
+        """snapshot_board_counts participates in the caller's transaction
+        read view without starting a nested transaction or emitting
+        COMMIT/ROLLBACK."""
+        conn = self._make_board_db()
+        self._insert_task(conn, "t1", "blocked")
+        self._insert_task(conn, "t2", "running")
+
+        # Start a write transaction on this connection.
+        conn.execute("BEGIN IMMEDIATE")
+        assert conn.in_transaction
+
+        # snapshot_board_counts must work inside the caller's txn.
+        snap = snapshot_board_counts(conn)
+        assert snap.blocked_count == 1
+        assert snap.non_archived_count == 2
+
+        # The caller's transaction is still open.
+        assert conn.in_transaction
+        conn.execute("COMMIT")
+        conn.close()
+
+    def test_snapshot_equality_with_board_stats_at_same_snapshot(self):
+        """Snapshot counts at the same read view must equal board_stats."""
+        conn = self._make_board_db()
+        self._insert_task(conn, "t1", "running")
+        self._insert_task(conn, "t2", "blocked")
+        self._insert_task(conn, "t3", "ready")
+        self._insert_task(conn, "t4", "blocked")
+        self._insert_task(conn, "t5", "archived")
+        self._insert_task(conn, "t6", "done")
+
+        # Take snapshot and manual board_stats in the same transaction
+        # to guarantee the same read view.
+        conn.execute("BEGIN")
+        snap = snapshot_board_counts(conn)
+        bs_total = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status != 'archived'"
+        ).fetchone()[0]
+        bs_blocked = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status = 'blocked'"
+        ).fetchone()[0]
+        conn.execute("COMMIT")
+
+        assert snap.non_archived_count == bs_total
+        assert snap.blocked_count == bs_blocked
+        assert snap.blocked_count <= snap.non_archived_count
+
 
 # ---------------------------------------------------------------------------
 # Rollback atomicity tests

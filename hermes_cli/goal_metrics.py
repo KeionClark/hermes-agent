@@ -836,7 +836,19 @@ def snapshot_board_counts(conn: sqlite3.Connection) -> BoardSnapshot:
     blocked_count: tasks with status='blocked' (non-archived).
     non_archived_count: all tasks where status != 'archived'.
 
-    Uses one consistent read snapshot. No writes to the source board.
+    Atomicity: both counts are computed in a single SQL statement so they
+    read from one consistent snapshot, even on an autocommit (canonical
+    ``isolation_level=None``) connection under WAL-mode concurrent writes.
+
+    Timestamp semantics: ``source_timestamp`` is taken immediately before
+    the aggregate query executes.  The snapshot reflects the board state
+    visible to the connection at (or fractionally after) that instant.
+
+    Caller-owned transaction: if the caller already holds a transaction,
+    the query participates in that transaction's read view — no nested
+    ``BEGIN`` is issued and no ``COMMIT``/``ROLLBACK`` is emitted.
+
+    No writes to the source board.
     """
     now = time.time()
     snapshot_id = str(uuid.uuid4())
@@ -852,17 +864,19 @@ def snapshot_board_counts(conn: sqlite3.Connection) -> BoardSnapshot:
         pass
     board_id = db_path or "unknown"
 
-    # Count non-archived tasks (same logic as board_stats).
-    non_archived_row = conn.execute(
-        "SELECT COUNT(*) AS n FROM tasks WHERE status != 'archived'"
+    # Single-statement aggregate: both counts come from one read snapshot.
+    # On autocommit the implicit transaction wraps exactly this statement;
+    # under an existing transaction it shares the caller's read view.
+    row = conn.execute(
+        "SELECT"
+        "  COUNT(*) AS non_archived,"
+        "  SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END) AS blocked"
+        " FROM tasks"
+        " WHERE status != 'archived'"
     ).fetchone()
-    non_archived_count = non_archived_row[0] if non_archived_row else 0
 
-    # Count blocked tasks.
-    blocked_row = conn.execute(
-        "SELECT COUNT(*) AS n FROM tasks WHERE status = 'blocked'"
-    ).fetchone()
-    blocked_count = blocked_row[0] if blocked_row else 0
+    non_archived_count = row[0] if row and row[0] is not None else 0
+    blocked_count = row[1] if row and row[1] is not None else 0
 
     return BoardSnapshot(
         blocked_count=blocked_count,
