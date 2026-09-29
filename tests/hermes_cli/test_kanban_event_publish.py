@@ -482,3 +482,122 @@ class TestDispatcherPaths:
               if e["payload"]["task_id"] == task_id and e["payload"]["from"] == "running"]
         # The last status_changed for this task from running should be to ready (retry)
         assert any(p["to"] == "ready" for p in sc)
+
+
+class TestScheduleTaskEmit:
+    """schedule_task must emit card.status_changed with actual prior status."""
+
+    def test_schedule_from_ready_emits_status_changed(self, board):
+        conn, _ = board
+        from hermes_cli.kanban_db import create_task, schedule_task
+        task_id = create_task(conn, title="Schedule ready", assignee="x")
+        ok = schedule_task(conn, task_id, reason="cron wait")
+        assert ok
+        sc = [e["payload"] for e in _bus_events(conn, "card.status_changed")
+              if e["payload"]["task_id"] == task_id and e["payload"]["to"] == "scheduled"]
+        assert len(sc) == 1
+        assert sc[0]["from"] == "ready"
+
+    def test_schedule_from_blocked_emits_status_changed(self, board):
+        conn, _ = board
+        from hermes_cli.kanban_db import create_task, claim_task, block_task, schedule_task
+        task_id = create_task(conn, title="Schedule blocked", assignee="x")
+        claimed = claim_task(conn, task_id)
+        block_task(conn, task_id, reason="wait", kind="needs_input",
+                   expected_run_id=claimed.current_run_id)
+        ok = schedule_task(conn, task_id, reason="timed park")
+        assert ok
+        sc = [e["payload"] for e in _bus_events(conn, "card.status_changed")
+              if e["payload"]["task_id"] == task_id and e["payload"]["to"] == "scheduled"]
+        assert len(sc) == 1
+        assert sc[0]["from"] == "blocked"
+
+    def test_schedule_from_running_emits_status_changed(self, board):
+        conn, _ = board
+        from hermes_cli.kanban_db import create_task, claim_task, schedule_task
+        task_id = create_task(conn, title="Schedule running", assignee="x")
+        claimed = claim_task(conn, task_id)
+        ok = schedule_task(conn, task_id, reason="park", expected_run_id=claimed.current_run_id)
+        assert ok
+        sc = [e["payload"] for e in _bus_events(conn, "card.status_changed")
+              if e["payload"]["task_id"] == task_id and e["payload"]["to"] == "scheduled"]
+        assert len(sc) == 1
+        assert sc[0]["from"] == "running"
+
+    def test_schedule_carries_run_id(self, board):
+        """The emitted event should carry the run_id from _end_or_synthesize_run."""
+        conn, _ = board
+        from hermes_cli.kanban_db import create_task, claim_task, schedule_task
+        task_id = create_task(conn, title="Schedule run_id", assignee="x")
+        claimed = claim_task(conn, task_id)
+        schedule_task(conn, task_id, reason="park", expected_run_id=claimed.current_run_id)
+        sc = [e["payload"] for e in _bus_events(conn, "card.status_changed")
+              if e["payload"]["task_id"] == task_id and e["payload"]["to"] == "scheduled"]
+        assert len(sc) == 1
+        assert "run_id" in sc[0]
+
+    def test_schedule_noop_no_event(self, board):
+        """Scheduling an already-scheduled task should not emit."""
+        conn, _ = board
+        from hermes_cli.kanban_db import create_task, schedule_task
+        task_id = create_task(conn, title="Schedule noop", assignee="x")
+        schedule_task(conn, task_id, reason="first")
+        # Count events so far
+        before = len(_bus_events(conn, "card.status_changed"))
+        ok = schedule_task(conn, task_id, reason="second")
+        assert not ok  # already scheduled, CAS fails
+        after = len(_bus_events(conn, "card.status_changed"))
+        assert after == before
+
+
+class TestUnblockScheduledFromStatus:
+    """unblock_task must report the actual prior status, not hardcoded 'blocked'."""
+
+    def test_unblock_from_scheduled_reports_scheduled(self, board):
+        """When unblocking a 'scheduled' task, from_status must be 'scheduled'."""
+        conn, _ = board
+        from hermes_cli.kanban_db import create_task, schedule_task, unblock_task
+        task_id = create_task(conn, title="Unblock scheduled", assignee="x")
+        schedule_task(conn, task_id, reason="cron wait")
+        ok = unblock_task(conn, task_id)
+        assert ok
+        sc = [e["payload"] for e in _bus_events(conn, "card.status_changed")
+              if e["payload"]["task_id"] == task_id and e["payload"]["from"] == "scheduled"]
+        assert len(sc) == 1, (
+            f"Expected one status_changed from 'scheduled', got {sc}"
+        )
+
+    def test_unblock_from_blocked_still_reports_blocked(self, board):
+        """When unblocking a 'blocked' task, from_status must still be 'blocked'."""
+        conn, _ = board
+        from hermes_cli.kanban_db import create_task, claim_task, block_task, unblock_task
+        task_id = create_task(conn, title="Unblock blocked", assignee="x")
+        claimed = claim_task(conn, task_id)
+        block_task(conn, task_id, reason="wait", kind="needs_input",
+                   expected_run_id=claimed.current_run_id)
+        ok = unblock_task(conn, task_id)
+        assert ok
+        sc = [e["payload"] for e in _bus_events(conn, "card.status_changed")
+              if e["payload"]["task_id"] == task_id and e["payload"]["from"] == "blocked"
+              and e["payload"]["to"] != "blocked"]  # skip the block transition itself
+        assert len(sc) >= 1, (
+            f"Expected at least one status_changed from 'blocked' (unblock), got {sc}"
+        )
+
+    def test_unblock_scheduled_no_false_blocked_event(self, board):
+        """The bug: unblocking a 'scheduled' task must NOT emit from='blocked'."""
+        conn, _ = board
+        from hermes_cli.kanban_db import create_task, schedule_task, unblock_task
+        task_id = create_task(conn, title="No false blocked", assignee="x")
+        schedule_task(conn, task_id, reason="park")
+        # Clear events up to this point so we only check the unblock emit
+        events_before_unblock = len(_bus_events(conn, "card.status_changed"))
+        ok = unblock_task(conn, task_id)
+        assert ok
+        all_sc = _bus_events(conn, "card.status_changed")
+        unblock_events = all_sc[events_before_unblock:]
+        for ev in unblock_events:
+            if ev["payload"]["task_id"] == task_id:
+                assert ev["payload"]["from"] != "blocked", (
+                    f"Unblocking a 'scheduled' task must not report from='blocked': {ev['payload']}"
+                )
