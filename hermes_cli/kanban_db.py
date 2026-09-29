@@ -3732,9 +3732,10 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     when that is where it left off), closing any leaked run first."""
     now = int(time.time())
     with write_txn(conn):
+        prior_status = _task_status(conn, task_id)
         resume_status = (
             _resume_status_from_events(conn, task_id)
-            if _task_status(conn, task_id) == "blocked"
+            if prior_status == "blocked"
             else "ready"
         )
         _reclaim_dangling_run(
@@ -3760,7 +3761,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
-        _ep().emit_status_changed(conn, task_id, from_status="blocked", to_status=new_status)
+        _ep().emit_status_changed(conn, task_id, from_status=prior_status, to_status=new_status)
         _append_event(
             conn, task_id, "unblocked",
             (
@@ -4107,6 +4108,7 @@ def schedule_task(
     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
     until ``unblock_task`` re-gates it."""
     with write_txn(conn):
+        prior_status = _task_status(conn, task_id)
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
@@ -4125,6 +4127,7 @@ def schedule_task(
         run_id = _end_or_synthesize_run(
             conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
         )
+        _ep().emit_status_changed(conn, task_id, from_status=prior_status, to_status="scheduled", run_id=run_id)
         _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
         return True
 
