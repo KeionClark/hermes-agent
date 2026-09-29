@@ -199,20 +199,25 @@ def migrate_event_bus(conn: sqlite3.Connection) -> None:
     integer) — independent of ``PRAGMA user_version`` used by other
     subsystems.
 
-    Uses ``conn.execute`` — NOT ``conn.executescript`` which auto-commits
-    any open transaction.  Called after ``executescript(SCHEMA_SQL)`` which
-    auto-committed, so we may NOT be inside a transaction.
-    """
-    # Create the version table if it doesn't exist (idempotent).
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS hermes_event_schema_version "
-        "(id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL)"
-    )
+    The canonical connection uses ``isolation_level=None`` (autocommit), so
+    bare ``conn.execute`` of DDL auto-commits each statement independently.
+    To guarantee atomicity (all-or-nothing: version table + bus DDL + stamp),
+    this function wraps every mutating step in an explicit ``BEGIN IMMEDIATE``
+    / ``COMMIT`` pair and rolls back on any failure.
 
-    row = conn.execute(
-        "SELECT version FROM hermes_event_schema_version WHERE id = 1"
-    ).fetchone()
-    current = row[0] if row else 0
+    Uses ``conn.execute`` — NOT ``conn.executescript`` which auto-commits
+    any open transaction.
+    """
+    # Probe version outside a write transaction (read-only).  The version
+    # table itself may not exist yet; we handle that below inside the txn.
+    try:
+        row = conn.execute(
+            "SELECT version FROM hermes_event_schema_version WHERE id = 1"
+        ).fetchone()
+        current = row[0] if row else 0
+    except sqlite3.OperationalError:
+        # Table does not exist yet — first run.
+        current = 0
 
     if current > _SCHEMA_VERSION:
         raise RuntimeError(
@@ -223,19 +228,52 @@ def migrate_event_bus(conn: sqlite3.Connection) -> None:
     if current >= _SCHEMA_VERSION:
         return  # Already at target version.
 
-    # Version 0 → 1: create all tables and indexes.
-    if current < 1:
-        for stmt in _SCHEMA_V1.split(";"):
-            stmt = stmt.strip()
-            if stmt:
-                conn.execute(stmt)
-
-        # Stamp version.
+    # --- Atomic write block: all DDL + stamp in one transaction. ----------
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # Re-check version under the write lock (another process may have
+        # migrated between our read above and acquiring the lock).
         conn.execute(
-            "INSERT OR REPLACE INTO hermes_event_schema_version (id, version) "
-            "VALUES (1, ?)",
-            (_SCHEMA_VERSION,),
+            "CREATE TABLE IF NOT EXISTS hermes_event_schema_version "
+            "(id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL)"
         )
+        row = conn.execute(
+            "SELECT version FROM hermes_event_schema_version WHERE id = 1"
+        ).fetchone()
+        current = row[0] if row else 0
+
+        if current >= _SCHEMA_VERSION:
+            conn.execute("COMMIT")
+            return  # Another writer got here first.
+
+        # Version 0 → 1: create all tables and indexes.
+        if current < 1:
+            for stmt in _SCHEMA_V1.split(";"):
+                stmt = stmt.strip()
+                if stmt:
+                    conn.execute(stmt)
+
+            # Stamp version.
+            conn.execute(
+                "INSERT OR REPLACE INTO hermes_event_schema_version "
+                "(id, version) VALUES (1, ?)",
+                (_SCHEMA_VERSION,),
+            )
+
+        conn.execute("COMMIT")
+    except BaseException:
+        with _suppress_rollback():
+            conn.execute("ROLLBACK")
+        raise
+
+
+def _suppress_rollback():
+    """Context manager that suppresses errors during ROLLBACK.
+
+    A ROLLBACK after a failed DDL should not mask the original exception.
+    """
+    import contextlib
+    return contextlib.suppress(Exception)
 
 
 # ---------------------------------------------------------------------------
