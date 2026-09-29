@@ -1289,11 +1289,49 @@ def get_task_log(task_id: str, tail: Optional[int] = Query(None, ge=1, le=2_000_
         "size_bytes": size, "content": content or "", "truncated": bool(tail and size > tail)}
 
 
+def _manual_dispatch_settings(config: Optional[dict] = None) -> tuple[Optional[str], Optional[int], Optional[int]]:
+    """Resolve the dashboard nudge's dispatcher settings from ``kanban`` config."""
+    try:
+        if config is None:
+            from hermes_cli.config import load_config
+
+            config = load_config()
+        from hermes_cli.config_read_errors import FailedConfigRead
+
+        if isinstance(config, FailedConfigRead):
+            raise RuntimeError("kanban configuration read failed") from config.read_error
+        kanban_config = config.get("kanban", {}) if isinstance(config, dict) else {}
+        default_assignee = (kanban_config.get("default_assignee") or "").strip() or None
+        max_in_progress_per_profile = kbd._positive_int(
+            kanban_config.get("max_in_progress_per_profile"), None,
+        )
+        max_in_progress = kbd.resolve_max_in_progress(
+            kbd._positive_int(kanban_config.get("max_in_progress"), None),
+        )
+        return default_assignee, max_in_progress, max_in_progress_per_profile
+    except Exception:
+        log.warning("dashboard dispatch refused: unable to resolve kanban settings", exc_info=True)
+        raise HTTPException(status_code=503, detail="Kanban dispatch configuration is unavailable")
+
+
 @router.post("/dispatch")
 def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), board: Optional[str] = Query(None)):
-    """Dispatch nudge so the UI doesn't wait out the 60 s dispatcher tick."""
+    """Dispatch nudge so the UI doesn't wait out the 60 s dispatcher tick.
+
+    It is still a normal dispatch tick: the dashboard must not bypass the
+    configured global/profile concurrency caps or default task routing.
+    """
+    default_assignee, max_in_progress, max_in_progress_per_profile = _manual_dispatch_settings()
     with _board_conn(board) as (board, conn):
-        result = kbd.dispatch_once(conn, dry_run=dry_run, max_spawn=max_n, board=board)
+        result = kbd.dispatch_once(
+            conn,
+            dry_run=dry_run,
+            max_spawn=max_n,
+            max_in_progress=max_in_progress,
+            default_assignee=default_assignee,
+            max_in_progress_per_profile=max_in_progress_per_profile,
+            board=board,
+        )
         try:
             return asdict(result)  # DispatchResult is a dataclass
         except TypeError:

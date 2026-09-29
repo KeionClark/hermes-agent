@@ -14,6 +14,7 @@ import subprocess
 import shutil
 import sys
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -478,6 +479,98 @@ def test_dispatch_dry_run(client):
     body = r.json()
     # DispatchResult is serialized as a dataclass dict.
     assert isinstance(body, dict)
+
+
+def test_dispatch_nudge_honors_configured_caps_and_default_assignee(client, kanban_home, monkeypatch):
+    """The manual dashboard nudge must be subject to the gateway's limits.
+
+    One release worker is already running.  The release profile is therefore
+    capped, while an unassigned card may use the configured default profile.
+    The global cap of two allows exactly that one additional worker.
+    """
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    dispatch_endpoint = next(route.endpoint for route in client.app.routes if route.path == "/api/plugins/kanban/dispatch")
+    api_globals = dispatch_endpoint.__globals__
+    settings = api_globals["_manual_dispatch_settings"]({"kanban": {
+        "default_assignee": "researcher",
+        "max_in_progress": 2,
+        "max_in_progress_per_profile": 1,
+    }})
+    monkeypatch.setitem(api_globals, "_manual_dispatch_settings", lambda: settings)
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda _name: True)
+
+    with kbc.connect_closing() as conn:
+        running_release = kb.create_task(conn, title="already running", assignee="release2")
+        capped_release = kb.create_task(conn, title="must defer", assignee="release2")
+        defaulted = kb.create_task(conn, title="may use default")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'running', worker_pid = ? WHERE id = ?",
+                (os.getpid(), running_release),
+            )
+
+    response = client.post("/api/plugins/kanban/dispatch?dry_run=true&max=8")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [(task_id, assignee) for task_id, assignee, _ in body["spawned"]] == [
+        (defaulted, "researcher"),
+    ]
+    assert body["auto_assigned_default"] == [defaulted]
+    assert body["skipped_per_profile_capped"] == [[capped_release, "release2", 1]]
+
+
+def test_dispatch_settings_fail_closed_on_invalid_config(client):
+    dispatch_endpoint = next(route.endpoint for route in client.app.routes if route.path == "/api/plugins/kanban/dispatch")
+    api_globals = dispatch_endpoint.__globals__
+
+    with pytest.raises(Exception) as exc_info:
+        api_globals["_manual_dispatch_settings"]({"kanban": {"default_assignee": 42}})
+
+    assert getattr(exc_info.value, "status_code", None) == 503
+
+
+def test_dispatch_settings_fail_closed_on_failed_config_read(client):
+    from hermes_cli.config_read_errors import FailedConfigRead
+
+    dispatch_endpoint = next(route.endpoint for route in client.app.routes if route.path == "/api/plugins/kanban/dispatch")
+    api_globals = dispatch_endpoint.__globals__
+    failed_config = FailedConfigRead(
+        {"kanban": {"max_in_progress": 14, "max_in_progress_per_profile": 1}},
+        error=OSError("config unavailable"),
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        api_globals["_manual_dispatch_settings"](failed_config)
+
+    assert getattr(exc_info.value, "status_code", None) == 503
+
+
+def test_dispatch_nudge_refuses_failed_config_without_mutating_ready_task(client, monkeypatch):
+    from hermes_cli.config_read_errors import FailedConfigRead
+
+    failed_config = FailedConfigRead(
+        {"kanban": {"max_in_progress": 14, "max_in_progress_per_profile": 1}},
+        error=OSError("config unavailable"),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.config",
+        types.SimpleNamespace(load_config=lambda: failed_config),
+    )
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="must remain ready", assignee="researcher")
+
+    response = client.post("/api/plugins/kanban/dispatch?max=1")
+
+    assert response.status_code == 503
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.claim_lock is None
+        assert task.worker_pid is None
 
 # ---------------------------------------------------------------------------
 # Triage column (new v1 status)
