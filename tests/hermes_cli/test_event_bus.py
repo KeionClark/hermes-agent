@@ -182,6 +182,169 @@ class TestMigration:
             )
         conn.close()
 
+    def test_migration_atomic_on_fresh_db(self):
+        """A failure mid-DDL leaves NO partial schema on a fresh DB.
+
+        Inject a SQLite authorizer that denies CREATE INDEX (the third DDL
+        statement).  After the expected DatabaseError, no event-bus tables
+        or version row should persist — the migration must roll back
+        entirely.
+        """
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        db_path = tmp.name
+
+        conn = sqlite3.connect(db_path, isolation_level=None)
+        conn.execute("PRAGMA journal_mode=WAL")
+
+        def deny_create_index(action, arg1, arg2, db, trigger):
+            if action == sqlite3.SQLITE_CREATE_INDEX:
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(deny_create_index)
+
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            migrate_event_bus(conn)
+
+        # Remove authorizer so we can inspect freely.
+        conn.set_authorizer(None)
+
+        # No bus tables should exist.
+        bus_tables = [
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name LIKE 'hermes_event%' ORDER BY name"
+            ).fetchall()
+        ]
+        assert bus_tables == [], (
+            f"partial schema persisted after failed migration: {bus_tables}"
+        )
+
+        # No version row should exist.
+        version_tables = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name = 'hermes_event_schema_version'"
+        ).fetchall()
+        assert version_tables == [], "version table persisted after rollback"
+
+        conn.close()
+        os.unlink(db_path)
+
+    def test_migration_atomic_on_legacy_db(self):
+        """A failure mid-DDL on a legacy board preserves existing tables.
+
+        Simulate a legacy board that already has task_events and a notifier
+        table.  After the failed migration, those tables must still be
+        intact and no event-bus tables should appear.
+        """
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        db_path = tmp.name
+
+        conn = sqlite3.connect(db_path, isolation_level=None)
+        conn.execute("PRAGMA journal_mode=WAL")
+
+        # Create pre-existing legacy tables.
+        conn.execute(
+            "CREATE TABLE task_events "
+            "(id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, "
+            "kind TEXT, payload TEXT, created_at INTEGER)"
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES ('t_legacy', 'created', 1000)"
+        )
+        conn.execute(
+            "CREATE TABLE notifier_state "
+            "(key TEXT PRIMARY KEY, value TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO notifier_state (key, value) "
+            "VALUES ('last_seen', '42')"
+        )
+
+        def deny_create_index(action, arg1, arg2, db, trigger):
+            if action == sqlite3.SQLITE_CREATE_INDEX:
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(deny_create_index)
+
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            migrate_event_bus(conn)
+
+        conn.set_authorizer(None)
+
+        # No bus tables should have leaked.
+        bus_tables = [
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name LIKE 'hermes_event%' ORDER BY name"
+            ).fetchall()
+        ]
+        assert bus_tables == [], (
+            f"partial schema persisted after failed migration: {bus_tables}"
+        )
+
+        # Legacy tables intact.
+        row = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = 't_legacy'"
+        ).fetchone()
+        assert row[0] == "created", "legacy task_events row corrupted"
+
+        notifier = conn.execute(
+            "SELECT value FROM notifier_state WHERE key = 'last_seen'"
+        ).fetchone()
+        assert notifier[0] == "42", "legacy notifier_state row corrupted"
+
+        conn.close()
+        os.unlink(db_path)
+
+    def test_migration_succeeds_after_prior_failure(self):
+        """After a failed migration, a retry without the fault succeeds."""
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        db_path = tmp.name
+
+        conn = sqlite3.connect(db_path, isolation_level=None)
+        conn.execute("PRAGMA journal_mode=WAL")
+
+        def deny_create_index(action, arg1, arg2, db, trigger):
+            if action == sqlite3.SQLITE_CREATE_INDEX:
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(deny_create_index)
+
+        with pytest.raises(sqlite3.DatabaseError):
+            migrate_event_bus(conn)
+
+        # Remove fault and retry.
+        conn.set_authorizer(None)
+        migrate_event_bus(conn)
+
+        # Full schema present.
+        tables = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert "hermes_events" in tables
+        assert "hermes_event_cursors" in tables
+        assert "hermes_event_schema_version" in tables
+
+        row = conn.execute(
+            "SELECT version FROM hermes_event_schema_version WHERE id = 1"
+        ).fetchone()
+        assert row[0] == 1
+
+        conn.close()
+        os.unlink(db_path)
+
 
 # ---------------------------------------------------------------------------
 # Publish tests
@@ -799,7 +962,7 @@ class TestAck:
         # Ack first matching event (type_a) — OK.
         ack(conn, "sub_a", evt_a1.id)
 
-        # Try to skip to third matching event without acking second — WAIT, 
+        # Try to skip to third matching event without acking second — WAIT,
         # evt_a2 IS the next matching one after acking evt_a1.
         # So acking evt_a2 should succeed.
         ack(conn, "sub_a", evt_a2.id)
