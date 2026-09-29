@@ -730,6 +730,7 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
                 conn.executescript(_kb.SCHEMA_SQL)
                 _migrate_add_optional_columns(conn)
                 _migrate_event_bus_schema(conn)
+                _migrate_goal_metrics_schema(conn)
                 _INITIALIZED_PATHS.add(resolved)
 
         conn, _ = _open_configured(path, _init_if_needed)
@@ -869,6 +870,16 @@ def _migrate_event_bus_schema(conn: sqlite3.Connection) -> None:
     """
     from hermes_cli.event_bus import migrate_event_bus
     migrate_event_bus(conn)
+
+
+def _migrate_goal_metrics_schema(conn: sqlite3.Connection) -> None:
+    """Run the goal-metrics schema migration after the event-bus migration.
+
+    Uses ``conn.execute`` (not ``executescript``) so it participates in the
+    caller's active transaction.  Idempotent; safe on fresh and legacy boards.
+    """
+    from hermes_cli.goal_metrics import migrate_goal_schema
+    migrate_goal_schema(conn)
 
 
 def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
