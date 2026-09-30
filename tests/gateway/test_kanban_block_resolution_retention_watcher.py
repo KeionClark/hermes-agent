@@ -108,11 +108,12 @@ def test_retention_sweep_enumerates_archived_boards(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     kb.create_board("archived-board")
-    kb.write_board_metadata("archived-board", archived=True)
     with kbc.connect(board="archived-board") as conn:
         task_id = kb.create_task(conn, title="archived board expiry", assignee="builder")
         _aged_resolution_event(conn, task_id)
 
+    archived_db = Path(kb.remove_board("archived-board", archive=True)["new_path"]) / "kanban.db"
+    assert archived_db.is_file()
     assert kww._purge_block_resolution_metadata(kb) == 2
-    with kbc.connect(board="archived-board") as conn:
+    with kbc.connect(db_path=archived_db) as conn:
         assert {event.kind for event in kb.list_events(conn, task_id)} == {"created", "blocked"}

@@ -40,7 +40,7 @@ _HEALTH_WINDOW = 6
 
 
 def _purge_block_resolution_metadata(kb: Any) -> int:
-    """Purge every board without relying on dispatch, subscriptions, or adapters."""
+    """Purge active and physically archived boards independently of dispatch."""
     from hermes_cli import kanban_db_connect as kbc
 
     total = 0
@@ -60,6 +60,23 @@ def _purge_block_resolution_metadata(kb: Any) -> int:
             total += kb.gc_events(conn, older_than_seconds=0)
         finally:
             conn.close()
+    archive_root = kb.boards_root() / "_archived"
+    if archive_root.is_dir():
+        for archive_dir in archive_root.iterdir():
+            if not archive_dir.is_dir() or archive_dir.is_symlink():
+                continue
+            archived_db = archive_dir / "kanban.db"
+            if not archived_db.is_file() or archived_db.is_symlink():
+                continue
+            resolved = str(archived_db.resolve())
+            if resolved in seen_db_paths:
+                continue
+            seen_db_paths.add(resolved)
+            conn = kbc.connect(db_path=archived_db)
+            try:
+                total += kb.gc_events(conn, older_than_seconds=0)
+            finally:
+                conn.close()
     return total
 
 
