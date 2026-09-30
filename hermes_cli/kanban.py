@@ -207,7 +207,7 @@ def _profile_author() -> str:
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
-    "schedule", "checkpoint", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
+    "schedule", "checkpoint", "unblock", "resolve-block", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
     "gc",
@@ -1061,6 +1061,25 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
 
 
+def _cmd_resolve_block(args: argparse.Namespace) -> int:
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return _err("kanban resolve-block is orchestrator-only; workers must hand off their assigned task")
+    actor = _stripped_or_none(getattr(args, "actor", None)) or _profile_author()
+    evidence = _joined_words(args.evidence)
+    if not evidence.strip():
+        return _err("resolve-block requires non-empty evidence")
+    with kbc.connect_closing() as conn:
+        try:
+            ok = kb.resolve_block_and_requeue(conn, args.task_id, actor=actor, evidence=evidence)
+        except ValueError as exc:
+            return _err(str(exc))
+        if not ok:
+            return _err(f"cannot resolve block {args.task_id} (not currently blocked or status changed)")
+        task = kb.get_task(conn, args.task_id)
+        print(f"Resolved {args.task_id} → {task.status} (evidence recorded)")
+        return 0
+
+
 def _cmd_request_review(args: argparse.Namespace) -> int:
     tid = args.task_id
     summary = _stripped_or_none(getattr(args, "summary", None))
@@ -1357,6 +1376,7 @@ _HANDLERS = {
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "schedule": _cmd_schedule, "checkpoint": _cmd_checkpoint, "unblock": _cmd_unblock,
+    "resolve-block": _cmd_resolve_block,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
@@ -1383,7 +1403,7 @@ Common subcommands:
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
   `complete <id>…`      Mark task(s) done
   `request-review <id>` Enter first-class review; `request-changes <id> <reason>` returns an active review to its implementer
-  `block <id> [reason]` Mark blocked; `checkpoint <id> <summary>` schedules bounded engineering continuation; `unblock <id>` to revive
+  `block <id> [reason]` Mark blocked; `checkpoint <id> <summary>` schedules bounded engineering continuation; `resolve-block <id> <evidence>` records why and requeues
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards
   `assignees`           Known profiles + counts

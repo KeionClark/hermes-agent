@@ -338,6 +338,11 @@ _SPECS = [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
+    _cmd("resolve-block", [
+        _TASK_ID,
+        _arg("evidence", nargs="+", help="Evidence that the concrete blocker changed (recorded atomically)"),
+        _arg("--actor", help="Actor accountable for the resolution (default: active profile or user)"),
+    ], help="Record an evidenced blocked-card resolution and requeue it through parent gates"),
     _cmd("request-review", [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),

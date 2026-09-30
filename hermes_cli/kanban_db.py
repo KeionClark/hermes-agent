@@ -3710,6 +3710,61 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+def resolve_block_and_requeue(
+    conn: sqlite3.Connection, task_id: str, *, actor: str, evidence: str,
+) -> bool:
+    """Atomically record an evidenced block resolution and requeue one blocked task.
+
+    This is intentionally narrower than :func:`unblock_task`: callers must name the
+    actor and the evidence that changed, and only a currently ``blocked`` task may
+    move. The same parent gate and review-resume semantics apply, while block kind
+    and recurrence history remain intact for any later re-block loop detection.
+    """
+    actor = (actor or "").strip()
+    evidence = (evidence or "").strip()
+    if not actor:
+        raise ValueError("block resolution actor is required")
+    if not evidence:
+        raise ValueError("block resolution evidence is required")
+
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, block_kind FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None or row["status"] != "blocked":
+            return False
+        resume_status = _resume_status_from_events(conn, task_id)
+        _reclaim_dangling_run(
+            conn, task_id, statuses=("blocked",), now=now,
+            note="invariant recovery on evidenced block resolution",
+        )
+        landing_status = _landing_status_after_parents(conn, task_id)
+        new_status = "review" if landing_status == "ready" and resume_status == "review" else landing_status
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, current_run_id = NULL, resume_after = NULL, "
+            "continuation_count = 0, consecutive_failures = 0, last_failure_error = NULL "
+            "WHERE id = ? AND status = 'blocked'",
+            (new_status, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        _insert_comment(conn, task_id, actor, f"Block resolved: {evidence}", now)
+        _append_event(conn, task_id, "block_resolved", {
+            "actor": actor,
+            "evidence": evidence,
+            "status": new_status,
+            "resume_status": resume_status,
+            "block_kind": row["block_kind"],
+        })
+        _append_event(conn, task_id, "unblocked", {
+            "status": new_status,
+            "resume_status": resume_status,
+            "via": "block_resolved",
+        })
+        return True
+
+
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """``review`` -> ``ready``/``todo`` so the implementer re-runs on the new
     comments; restores the implementer from the ``review_requested`` event.
@@ -4601,6 +4656,48 @@ def latest_summaries(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+
+
+def latest_activity_previews(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
+    """Newest card activity, separate from a worker's last handoff summary.
+
+    ``latest_summary`` is useful run history but can be older than a blocker
+    comment or lifecycle event. The dashboard uses this compact field to show
+    what happened last without reinterpreting an old run summary as current state.
+    """
+    ids = list(task_ids)
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"""
+        WITH activity AS (
+            SELECT task_id, 'comment' AS kind, body AS text, author, created_at, id, 3 AS tie_break
+              FROM task_comments WHERE task_id IN ({placeholders})
+            UNION ALL
+            SELECT task_id, 'event:' || kind AS kind, NULL AS text, NULL AS author, created_at, id, 2 AS tie_break
+              FROM task_events WHERE task_id IN ({placeholders})
+            UNION ALL
+            SELECT task_id, 'run' AS kind, summary AS text, profile AS author,
+                   COALESCE(ended_at, started_at) AS created_at, id, 1 AS tie_break
+              FROM task_runs
+             WHERE task_id IN ({placeholders}) AND summary IS NOT NULL AND summary != ''
+        ), ranked AS (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY task_id ORDER BY created_at DESC, tie_break DESC, id DESC
+            ) AS rn FROM activity
+        )
+        SELECT task_id, kind, text, author, created_at FROM ranked WHERE rn = 1
+        """,
+        [*ids, *ids, *ids],
+    ).fetchall()
+    return {
+        row["task_id"]: {
+            "kind": row["kind"], "text": row["text"], "author": row["author"],
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    }
 
 
 # --- Split modules (imported at the tail: they import this module as ``_kb``) ---

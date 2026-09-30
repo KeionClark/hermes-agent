@@ -170,8 +170,21 @@ BOARD_COLUMNS: list[str] = ["triage", "todo", "scheduled", "ready", "running", "
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
 
+def _activity_preview(activity: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Bound board-card activity text to the existing summary-preview limit."""
+    if activity is None:
+        return None
+    preview = dict(activity)
+    text = preview.get("text")
+    if isinstance(text, str):
+        preview["text"] = text[:_CARD_SUMMARY_PREVIEW_CHARS]
+    return preview
 
-def _task_dict(task: kanban_db.Task, *, latest_summary: Optional[str] = None) -> dict[str, Any]:
+
+def _task_dict(
+    task: kanban_db.Task, *, latest_summary: Optional[str] = None,
+    latest_activity: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     d = asdict(task)
     # Derived age metrics so the UI can colour stale cards without client deltas.
     try:
@@ -180,6 +193,7 @@ def _task_dict(task: kanban_db.Task, *, latest_summary: Optional[str] = None) ->
         d["age"] = {"created_age_seconds": None, "started_age_seconds": None, "time_to_complete_seconds": None}
     # Latest non-null run summary (workers hand off via ``task_runs.summary``, not ``tasks.result``).
     d["latest_summary"] = latest_summary
+    d["latest_activity"] = _activity_preview(latest_activity)
     return d
 
 
@@ -308,10 +322,15 @@ def get_board(
             columns["archived"] = []
         # One window-function query for latest summaries (avoids N+1); cards get a
         # truncated preview, the full text comes from /tasks/:id.
-        summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
+        task_ids = [t.id for t in tasks]
+        summary_map = kanban_db.latest_summaries(conn, task_ids)
+        activity_map = kanban_db.latest_activity_previews(conn, task_ids)
         for t in tasks:
             full = summary_map.get(t.id)
-            d = _task_dict(t, latest_summary=(full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None))
+            d = _task_dict(
+                t, latest_summary=(full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None),
+                latest_activity=activity_map.get(t.id),
+            )
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
@@ -369,7 +388,10 @@ def get_task(
             raise HTTPException(status_code=400, detail="run_state_type must be 'status' or 'outcome'")
         task = _require_task(conn, task_id)
         # Drawer returns the FULL summary (cards on /board carry a 200-char preview).
-        task_d = _task_dict(task, latest_summary=kanban_db.latest_summary(conn, task_id))
+        task_d = _task_dict(
+            task, latest_summary=kanban_db.latest_summary(conn, task_id),
+            latest_activity=kanban_db.latest_activity_previews(conn, [task_id]).get(task_id),
+        )
         links = _links_for(conn, task_id)
         child_summaries = kanban_db.latest_summaries(conn, links["children"])
         children = filter(None, (kanban_db.get_task(conn, cid) for cid in links["children"]))
@@ -808,6 +830,27 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
 class CommentBody(BaseModel):
     body: str
     author: Optional[str] = "dashboard"
+
+
+class ResolveBlockBody(BaseModel):
+    actor: str
+    evidence: str
+
+
+@router.post("/tasks/{task_id}/resolve-block")
+def resolve_block(task_id: str, payload: ResolveBlockBody, board: Optional[str] = Query(None)):
+    if not payload.actor.strip() or not payload.evidence.strip():
+        raise HTTPException(status_code=400, detail="actor and evidence are required")
+    with _board_conn(board) as (board, conn):
+        _require_task(conn, task_id)
+        with _map_errors(400, ValueError):
+            ok = kanban_db.resolve_block_and_requeue(
+                conn, task_id, actor=payload.actor, evidence=payload.evidence,
+            )
+        if not ok:
+            raise _conflict("Task is not currently blocked or changed during resolution")
+        task = kanban_db.get_task(conn, task_id)
+        return {"task": _task_dict(task) if task else None}
 
 
 @router.post("/tasks/{task_id}/comments")
