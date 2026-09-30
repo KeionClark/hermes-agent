@@ -41,6 +41,14 @@ def _init_git_repo(repo: Path) -> None:
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True)
 
 
+def _backdate_comments(conn, task_id: str, seconds: int = 60) -> None:
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_comments SET created_at = created_at - ? WHERE task_id = ?",
+            (seconds, task_id),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Schema / init
 # ---------------------------------------------------------------------------
@@ -743,6 +751,60 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
 # ---------------------------------------------------------------------------
 # Respawn guard (check_respawn_guard + dispatch_once integration)
 # ---------------------------------------------------------------------------
+
+
+def test_fenced_checkpoint_resume_lifts_active_pr_guard_only_for_same_card(kanban_home):
+    """A real fenced continuation may finish its PR; ordinary PR cards stay held."""
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="continue existing PR", assignee="builder")
+        kb.add_comment(conn, task_id, author="builder", body="Opened https://github.com/a/b/pull/1")
+        _backdate_comments(conn, task_id)
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        assert kbd.check_respawn_guard(conn, task_id) == "active_pr"
+
+        assert kb.checkpoint_task(
+            conn, task_id, summary="continue implementation", delay_seconds=1,
+            expected_run_id=claimed.current_run_id,
+        ) == (True, False)
+        scheduled = kb.get_task(conn, task_id)
+        assert scheduled is not None and scheduled.resume_after is not None
+        assert kb.resume_due_checkpoints(conn, now=scheduled.resume_after) == [task_id]
+        assert kbd.check_respawn_guard(conn, task_id) is None
+
+        ordinary_id = kb.create_task(conn, title="ordinary PR", assignee="builder")
+        kb.add_comment(conn, ordinary_id, author="builder", body="Opened https://github.com/a/b/pull/2")
+        _backdate_comments(conn, ordinary_id)
+        # A resume event carrying another card's run id is not a same-card
+        # continuation and must not lift the duplicate-PR guard.
+        kb._append_event(
+            conn, ordinary_id, "checkpoint_resumed",
+            {"status": "ready", "checkpoint_run_id": claimed.current_run_id},
+        )
+        assert kbd.check_respawn_guard(conn, ordinary_id) == "active_pr"
+
+
+def test_checkpoint_exhaustion_preserves_recurrence_history_for_triage(kanban_home):
+    """Continuation exhaustion cannot erase a prior repeated needs-input hold."""
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="repeat checkpoint", assignee="builder")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET continuation_count = ?, block_kind = ?, block_recurrences = ? WHERE id = ?",
+                (kb.DEFAULT_CONTINUATION_LIMIT, "needs_input", 2, task_id),
+            )
+
+        assert kb.checkpoint_task(
+            conn, task_id, summary="still needs operator input", expected_run_id=claimed.current_run_id,
+        ) == (True, True)
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert (task.status, task.block_kind, task.block_recurrences) == ("triage", "needs_input", 3)
+        run = kb.latest_run(conn, task_id)
+        assert run is not None and run.outcome == "continuation_exhausted"
+        assert kb.goal_run_status(conn, task_id, claimed.current_run_id) == "blocked"
 
 
 

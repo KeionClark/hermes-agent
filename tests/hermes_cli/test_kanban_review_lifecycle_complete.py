@@ -548,6 +548,17 @@ def test_goal_run_status_is_bound_to_original_run(conn) -> None:
     assert current.current_run_id == successor.current_run_id
 
 
+def test_goal_run_status_reports_checkpointed_run_as_scheduled(conn) -> None:
+    task_id = kb.create_task(conn, title="checkpoint status", assignee="builder")
+    claimed = kb.claim_task(conn, task_id)
+    assert claimed is not None
+    assert kb.checkpoint_task(
+        conn, task_id, summary="resume later", expected_run_id=claimed.current_run_id,
+    ) == (True, False)
+
+    assert kb.goal_run_status(conn, task_id, claimed.current_run_id) == "scheduled"
+
+
 def test_parked_review_approval_without_evidence_still_creates_audit_run(conn) -> None:
     task_id = kb.create_task(conn, title="Manual approval", assignee="reviewer")
     assert kb.request_review(conn, task_id, summary="implementation handoff")

@@ -2360,6 +2360,8 @@ _RUN_OUTCOME_TERMINAL_STATUS = {
     "changes_requested": "changes_requested",
     "blocked": "blocked",
     "dependency_wait": "blocked",
+    "checkpointed": "scheduled",
+    "continuation_exhausted": "blocked",
 }
 
 
@@ -4028,7 +4030,8 @@ def checkpoint_task(
     now = int(time.time())
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, current_run_id, continuation_count FROM tasks WHERE id = ?", (task_id,),
+            "SELECT status, current_run_id, continuation_count, block_kind, block_recurrences "
+            "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None or row["status"] != "running" or row["current_run_id"] != int(expected_run_id):
             return False, False
@@ -4037,21 +4040,28 @@ def checkpoint_task(
             reason = (
                 f"Continuation budget ({DEFAULT_CONTINUATION_LIMIT}) exhausted after checkpoint: {summary}"
             )
+            new_status, event_kind, set_sql, route_params, payload = _route_block(
+                "needs_input", reason, "running",
+                prev_kind=_row_get(row, "block_kind"),
+                prev_recurrences=int(_row_get(row, "block_recurrences") or 0),
+            )
+            payload.update({
+                "continuation_count": attempt,
+                "continuation_limit": DEFAULT_CONTINUATION_LIMIT,
+            })
             cur = conn.execute(
-                "UPDATE tasks SET status = 'blocked', claim_lock = NULL, claim_expires = NULL, "
+                f"UPDATE tasks SET status = '{new_status}', claim_lock = NULL, claim_expires = NULL, "
                 "worker_pid = NULL, worker_started_at = NULL, resume_after = NULL, "
-                "continuation_count = ?, block_kind = 'needs_input', block_recurrences = 1 "
+                f"continuation_count = ?, {set_sql} "
                 "WHERE id = ? AND status = 'running' AND current_run_id = ?",
-                (attempt, task_id, int(expected_run_id)),
+                (attempt, *route_params, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
                 return False, False
-            run_id = _end_run(conn, task_id, outcome="continuation_exhausted", status="blocked", summary=reason)
-            _append_event(conn, task_id, "blocked", {
-                "kind": "needs_input", "reason": reason,
-                "continuation_count": attempt, "continuation_limit": DEFAULT_CONTINUATION_LIMIT,
-                "source_status": "running",
-            }, run_id=run_id)
+            run_id = _end_run(
+                conn, task_id, outcome="continuation_exhausted", status=new_status, summary=reason,
+            )
+            _append_event(conn, task_id, event_kind, payload, run_id=run_id)
             return True, True
         resume_after = now + delay
         cur = conn.execute(
@@ -4089,7 +4099,17 @@ def resume_due_checkpoints(conn: sqlite3.Connection, *, now: Optional[int] = Non
             )
             if cur.rowcount != 1:
                 continue
-            _append_event(conn, task_id, "checkpoint_resumed", {"status": status})
+            checkpoint = conn.execute(
+                "SELECT e.run_id FROM task_events e JOIN task_runs r ON r.id = e.run_id "
+                "WHERE e.task_id = ? AND e.kind = 'checkpointed' AND e.run_id IS NOT NULL "
+                "AND r.task_id = ? AND r.outcome = 'checkpointed' AND r.ended_at IS NOT NULL "
+                "ORDER BY e.id DESC LIMIT 1",
+                (task_id, task_id),
+            ).fetchone()
+            payload = {"status": status}
+            if checkpoint is not None:
+                payload["checkpoint_run_id"] = int(checkpoint["run_id"])
+            _append_event(conn, task_id, "checkpoint_resumed", payload)
             resumed.append(task_id)
     return resumed
 

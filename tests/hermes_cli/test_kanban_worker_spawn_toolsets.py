@@ -215,5 +215,6 @@ toolsets:
     from model_tools import get_tool_definitions
     names = {t["function"]["name"] for t in get_tool_definitions(resolved, quiet_mode=True, skip_tool_search_assembly=True)}
     assert "kanban_complete" in names
+    assert "kanban_checkpoint" in names
     assert "kanban_list" not in names
     assert resolved != ["kanban"]

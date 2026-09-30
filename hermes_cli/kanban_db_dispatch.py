@@ -1641,6 +1641,8 @@ def check_respawn_guard(
         ).fetchall()
         if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
             return None
+        if _has_fenced_checkpoint_resume_after(conn, task_id, int(c["created_at"] or 0)):
+            return None
         return "active_pr"
 
     return None
@@ -1660,6 +1662,46 @@ def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
         return False
     to = data.get("assignee")
     return bool(to) and "from" in data and data["from"] != to
+
+
+def _has_fenced_checkpoint_resume_after(
+    conn: sqlite3.Connection, task_id: str, after: int,
+) -> bool:
+    """True only for a kernel-recorded same-card checkpoint/resume after ``after``.
+
+    A resumed checkpoint is a deliberate continuation of the worker that made
+    the PR, rather than a new implementation attempt.  It needs a durable
+    fence to avoid a generic ``checkpoint_resumed`` event becoming a way to
+    bypass the duplicate-PR guard.
+    """
+    events = conn.execute(
+        "SELECT id, created_at, payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'checkpoint_resumed' AND created_at > ? "
+        "ORDER BY id DESC",
+        (task_id, after),
+    ).fetchall()
+    for event in events:
+        data = _kb._json_or(event["payload"], {})
+        if not isinstance(data, dict):
+            continue
+        run_id = data.get("checkpoint_run_id")
+        if not isinstance(run_id, int) or isinstance(run_id, bool):
+            continue
+        run = conn.execute(
+            "SELECT 1 FROM task_runs WHERE id = ? AND task_id = ? "
+            "AND outcome = 'checkpointed' AND ended_at IS NOT NULL",
+            (run_id, task_id),
+        ).fetchone()
+        if run is None:
+            continue
+        checkpoint = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'checkpointed' "
+            "AND run_id = ? AND id < ? LIMIT 1",
+            (task_id, run_id, int(event["id"])),
+        ).fetchone()
+        if checkpoint is not None:
+            return True
+    return False
 
 
 def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
