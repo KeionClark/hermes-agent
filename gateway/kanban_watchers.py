@@ -18,6 +18,7 @@ from typing import Any, Optional
 from gateway.kanban_watchers_common import (
     _acquire_singleton_lock,
     _kanban_dispatch_allowed,
+    _list_boards,
     _release_singleton_lock,
     _resolve_auto_decompose_settings,
     _gc_retention_days,
@@ -44,7 +45,7 @@ def _purge_block_resolution_metadata(kb: Any) -> int:
 
     total = 0
     seen_db_paths: set[str] = set()
-    for board_meta in _list_boards(kb):
+    for board_meta in _list_boards(kb, include_archived=True):
         slug = board_meta.get("slug") or kb.DEFAULT_BOARD
         db_path = board_meta.get("db_path")
         try:

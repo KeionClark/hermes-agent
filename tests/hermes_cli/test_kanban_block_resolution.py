@@ -163,6 +163,23 @@ def test_resolution_metadata_is_hidden_at_the_30_day_boundary_before_gc(kanban_h
         assert conn.execute("SELECT count(*) FROM task_events WHERE task_id = ?", (task_id,)).fetchone()[0] == 4
 
 
+def test_latest_activity_preview_hides_resolution_metadata_at_the_30_day_boundary(kanban_home):
+    with kbc.connect() as conn:
+        task_id = _blocked(conn)
+        assert kb.resolve_block_and_requeue(
+            conn, task_id, actor="ops", evidence_ref="case:0123456789abcdef",
+        )
+        boundary = int(time.time()) - kb.BLOCK_RESOLUTION_METADATA_MAX_AGE_SECONDS
+        conn.execute(
+            "UPDATE task_events SET created_at = ? WHERE task_id = ? AND "
+            "(kind = 'block_resolved' OR (kind = 'unblocked' AND payload LIKE '%block_resolved%'))",
+            (boundary, task_id),
+        )
+        conn.commit()
+        preview = kb.latest_activity_previews(conn, [task_id])[task_id]
+        assert preview["kind"] == "event:blocked"
+
+
 def test_resolution_metadata_is_physically_purged_before_the_30_day_limit(kanban_home):
     with kbc.connect() as conn:
         task_id = _blocked(conn)

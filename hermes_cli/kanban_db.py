@@ -4722,6 +4722,7 @@ def latest_activity_previews(conn: sqlite3.Connection, task_ids: Iterable[str]) 
     if not ids:
         return {}
     placeholders = ",".join("?" for _ in ids)
+    resolution_cutoff = int(time.time()) - BLOCK_RESOLUTION_METADATA_MAX_AGE_SECONDS
     rows = conn.execute(
         f"""
         WITH activity AS (
@@ -4729,7 +4730,9 @@ def latest_activity_previews(conn: sqlite3.Connection, task_ids: Iterable[str]) 
               FROM task_comments WHERE task_id IN ({placeholders})
             UNION ALL
             SELECT task_id, 'event:' || kind AS kind, NULL AS text, NULL AS author, created_at, id, 2 AS tie_break
-              FROM task_events WHERE task_id IN ({placeholders})
+              FROM task_events
+             WHERE task_id IN ({placeholders})
+               AND NOT (created_at <= ? AND {_resolution_metadata_sql()})
             UNION ALL
             SELECT task_id, 'run' AS kind, summary AS text, profile AS author,
                    COALESCE(ended_at, started_at) AS created_at, id, 1 AS tie_break
@@ -4742,7 +4745,7 @@ def latest_activity_previews(conn: sqlite3.Connection, task_ids: Iterable[str]) 
         )
         SELECT task_id, kind, text, author, created_at FROM ranked WHERE rn = 1
         """,
-        [*ids, *ids, *ids],
+        [*ids, *ids, resolution_cutoff, *ids],
     ).fetchall()
     return {
         row["task_id"]: {

@@ -34,10 +34,10 @@ async def _to_thread_process_service(func: Callable[..., Any], /, *args: Any) ->
     return await asyncio.to_thread(_run_in_fresh_context, func, *args)
 
 
-def _list_boards(kb: Any) -> list:
-    """Enumerate live boards; fall back to the default board when listing fails."""
+def _list_boards(kb: Any, *, include_archived: bool = False) -> list:
+    """Enumerate boards; fall back to the default board when listing fails."""
     try:
-        return kb.list_boards(include_archived=False)
+        return kb.list_boards(include_archived=include_archived)
     except Exception:
         return [kb.read_board_metadata(kb.DEFAULT_BOARD)]
 
