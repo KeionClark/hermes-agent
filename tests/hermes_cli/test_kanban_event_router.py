@@ -35,7 +35,9 @@ def test_latest_multiple_filters_order_dedup_restart_and_cli(tmp_path):
     conn.close()
     proc = subprocess.run([sys.executable, "-m", "hermes_cli.kanban_event_router", "--board-path", str(path),
                            "--subscriber-id", "a", "--event-type", "a"], capture_output=True, text=True)
-    assert proc.returncode == 0, proc.stderr
+    # The operator-facing runner now refuses a public board and a non-card
+    # event type; low-level router fixtures remain general-purpose.
+    assert proc.returncode != 0
     conn = connect(path)
     assert router.run_once(conn, {"a": router.Subscriber(frozenset({"a"}), router.enqueue_inbox("a"))}) == {"a": 0}
     assert conn.execute("SELECT COUNT(*) FROM hermes_router_inbox").fetchone()[0] == 3
