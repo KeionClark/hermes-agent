@@ -1566,7 +1566,8 @@ KANBAN_GOAL_CONTINUATION_TEMPLATE = (
     "is genuinely finished, call kanban_complete with a summary. If it is a "
     "code change that needs same-card review before counting as done, call "
     "kanban_request_review with a summary instead. If you are blocked and "
-    "need human input, call kanban_block with a reason. Do not stop without "
+    "need human input, call kanban_block with a reason. If the execution window is ending "
+    "but engineering can continue, call kanban_checkpoint with a concrete progress summary. Do not stop without "
     "calling one of them."
 )
 
@@ -1587,6 +1588,7 @@ KANBAN_GOAL_FINALIZE_TEMPLATE = (
 _KANBAN_TERMINAL_STATUSES = {
     "done": ("completed_by_worker", "worker completed the task", "task {task_id} completed by worker after {turns} turn(s)"),
     "blocked": ("blocked_by_worker", "worker blocked the task", "task {task_id} blocked by worker after {turns} turn(s)"),
+    "scheduled": ("checkpointed_by_worker", "worker checkpointed the task", "task {task_id} checkpointed by worker after {turns} turn(s)"),
     # kanban_request_review is a legitimate terminator: implementation done, awaiting a reviewer.
     "review": ("review_requested_by_worker", "worker requested review", "task {task_id} handed off for review by worker after {turns} turn(s)"),
     "changes_requested": ("changes_requested_by_reviewer", "reviewer requested changes", "reviewer returned task {task_id} for changes after {turns} turn(s)"),

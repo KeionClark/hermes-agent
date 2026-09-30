@@ -136,6 +136,20 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_checkpoint_handler_requires_current_run_and_schedules(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    out = json.loads(kt._handle_checkpoint({"summary": "clean revision; next route remains"}))
+    assert out["ok"] is True
+    assert out["status"] == "scheduled"
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert task.status == "scheduled"
+        assert task.continuation_count == 1
+
+
 def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
     """After a phantom rejection, retrying kanban_complete with
     created_cards=[] (the documented escape hatch) must complete the

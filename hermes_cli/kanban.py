@@ -207,7 +207,7 @@ def _profile_author() -> str:
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
-    "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
+    "schedule", "checkpoint", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
     "gc",
@@ -1027,6 +1027,25 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
         return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{suffix}", lambda tid: f"cannot schedule {tid}")
 
 
+def _cmd_checkpoint(args: argparse.Namespace) -> int:
+    summary = _joined_words(args.summary)
+    with kbc.connect_closing() as conn:
+        ok, exhausted = kb.checkpoint_task(
+            conn, args.task_id, summary=summary, delay_seconds=args.delay_seconds,
+            expected_run_id=_worker_run_id_for(args.task_id),
+        )
+        if not ok:
+            return _err(f"cannot checkpoint {args.task_id} (stale run, not running, or continuation state changed)")
+        task = kb.get_task(conn, args.task_id)
+        if exhausted:
+            return _err(
+                f"Continuation budget exhausted for {args.task_id}; it is now blocked for operator review.")
+        print(
+            f"Checkpointed {args.task_id}; resumes at {task.resume_after} "
+            f"(continuation {task.continuation_count}/{kb.DEFAULT_CONTINUATION_LIMIT})")
+        return 0
+
+
 def _cmd_unblock(args: argparse.Namespace) -> int:
     if os.environ.get("HERMES_KANBAN_TASK"):
         return _err("kanban unblock is orchestrator-only; workers must hand off their assigned task")
@@ -1337,7 +1356,7 @@ _HANDLERS = {
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
-    "schedule": _cmd_schedule, "unblock": _cmd_unblock,
+    "schedule": _cmd_schedule, "checkpoint": _cmd_checkpoint, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
@@ -1364,7 +1383,7 @@ Common subcommands:
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
   `complete <id>…`      Mark task(s) done
   `request-review <id>` Enter first-class review; `request-changes <id> <reason>` returns an active review to its implementer
-  `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
+  `block <id> [reason]` Mark blocked; `checkpoint <id> <summary>` schedules bounded engineering continuation; `unblock <id>` to revive
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards
   `assignees`           Known profiles + counts

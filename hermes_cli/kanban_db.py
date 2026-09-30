@@ -738,6 +738,8 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    resume_after: Optional[int] = None
+    continuation_count: int = 0
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -755,6 +757,8 @@ class Task:
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            resume_after=_opt_int(g("resume_after")),
+            continuation_count=int(g("continuation_count") or 0),
         )
 
 
@@ -972,7 +976,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Bounded worker checkpoints are scheduled continuations, not blockers.
+    resume_after         INTEGER,
+    continuation_count   INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2791,7 +2798,9 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       resume_after = NULL,
+                       continuation_count = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                 """
@@ -3284,6 +3293,7 @@ def block_task(
                        claim_lock    = NULL,
                        claim_expires = NULL,
                        worker_pid    = NULL,
+                       resume_after  = NULL,
                        {set_sql}
                  WHERE id = ?
                    AND status IN ('running', 'ready')
@@ -3676,8 +3686,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # (the dispatcher's spawn/crash counter) IS reset — a deliberate unblock
         # is a fresh start for the retry budget.
         cur = conn.execute(
-            "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "UPDATE tasks SET status = ?, current_run_id = NULL, resume_after = NULL, "
+            "continuation_count = 0, consecutive_failures = 0, last_failure_error = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
         )
         if cur.rowcount != 1:
@@ -3984,6 +3994,104 @@ def schedule_task(
         )
         _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
         return True
+
+
+DEFAULT_CONTINUATION_LIMIT = 3
+DEFAULT_CONTINUATION_DELAY_SECONDS = 60
+MAX_CONTINUATION_DELAY_SECONDS = 3600
+
+
+def checkpoint_task(
+    conn: sqlite3.Connection, task_id: str, *, summary: str,
+    delay_seconds: int = DEFAULT_CONTINUATION_DELAY_SECONDS,
+    expected_run_id: Optional[int] = None,
+) -> tuple[bool, bool]:
+    """Close one active run as a bounded, delayed engineering continuation.
+
+    Returns ``(ok, exhausted)``.  A checkpoint is deliberately distinct from a
+    block: it preserves a concrete handoff, clears the live claim, and lets the
+    dispatcher resume the same card after ``delay_seconds`` without charging the
+    failure or block-loop budgets.  A stale worker cannot checkpoint a successor
+    because the current run id is a mandatory CAS.  Once the continuation budget
+    is spent, the card lands in a genuine ``needs_input`` block for an operator
+    to re-scope or explicitly unblock it rather than silently looping forever.
+    """
+    summary = (summary or "").strip()
+    if not summary:
+        raise ValueError("checkpoint summary is required")
+    delay = int(delay_seconds)
+    if delay < 1 or delay > MAX_CONTINUATION_DELAY_SECONDS:
+        raise ValueError(
+            f"checkpoint delay must be between 1 and {MAX_CONTINUATION_DELAY_SECONDS} seconds")
+    if expected_run_id is None:
+        return False, False
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id, continuation_count FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None or row["status"] != "running" or row["current_run_id"] != int(expected_run_id):
+            return False, False
+        attempt = int(_row_get(row, "continuation_count") or 0) + 1
+        if attempt > DEFAULT_CONTINUATION_LIMIT:
+            reason = (
+                f"Continuation budget ({DEFAULT_CONTINUATION_LIMIT}) exhausted after checkpoint: {summary}"
+            )
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'blocked', claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL, worker_started_at = NULL, resume_after = NULL, "
+                "continuation_count = ?, block_kind = 'needs_input', block_recurrences = 1 "
+                "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+                (attempt, task_id, int(expected_run_id)),
+            )
+            if cur.rowcount != 1:
+                return False, False
+            run_id = _end_run(conn, task_id, outcome="continuation_exhausted", status="blocked", summary=reason)
+            _append_event(conn, task_id, "blocked", {
+                "kind": "needs_input", "reason": reason,
+                "continuation_count": attempt, "continuation_limit": DEFAULT_CONTINUATION_LIMIT,
+                "source_status": "running",
+            }, run_id=run_id)
+            return True, True
+        resume_after = now + delay
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'scheduled', claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, worker_started_at = NULL, resume_after = ?, continuation_count = ? "
+            "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+            (resume_after, attempt, task_id, int(expected_run_id)),
+        )
+        if cur.rowcount != 1:
+            return False, False
+        run_id = _end_run(conn, task_id, outcome="checkpointed", status="scheduled", summary=summary)
+        _append_event(conn, task_id, "checkpointed", {
+            "summary": summary, "resume_after": resume_after,
+            "continuation_count": attempt, "continuation_limit": DEFAULT_CONTINUATION_LIMIT,
+        }, run_id=run_id)
+        return True, False
+
+
+def resume_due_checkpoints(conn: sqlite3.Connection, *, now: Optional[int] = None) -> list[str]:
+    """Promote due checkpoint continuations only; manual scheduled tasks stay parked."""
+    now = int(time.time()) if now is None else int(now)
+    resumed: list[str] = []
+    with write_txn(conn):
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE status = 'scheduled' AND resume_after IS NOT NULL "
+            "AND resume_after <= ? ORDER BY resume_after, id", (now,),
+        ).fetchall()
+        for row in rows:
+            task_id = row["id"]
+            status = _landing_status_after_parents(conn, task_id)
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, resume_after = NULL WHERE id = ? "
+                "AND status = 'scheduled' AND resume_after IS NOT NULL AND resume_after <= ?",
+                (status, task_id, now),
+            )
+            if cur.rowcount != 1:
+                continue
+            _append_event(conn, task_id, "checkpoint_resumed", {"status": status})
+            resumed.append(task_id)
+    return resumed
 
 
 # --- Worker context builder (what a spawned worker sees) ---

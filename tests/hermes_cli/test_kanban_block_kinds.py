@@ -58,6 +58,79 @@ def _make_running_again(conn, tid):
     assert kb.claim_task(conn, tid, claimer="worker") is not None
 
 
+def test_checkpoint_is_fenced_and_resumes_without_block_accounting(kanban_home: Path) -> None:
+    """An execution-window handoff is scheduled work, not a false human block."""
+    with kbc.connect() as conn:
+        tid = _running_task(conn)
+        run_id = kb.get_task(conn, tid).current_run_id
+
+        assert kb.checkpoint_task(
+            conn, tid, summary="clean checkpoint; wire the next route", delay_seconds=1,
+            expected_run_id=run_id,
+        ) == (True, False)
+        parked = kb.get_task(conn, tid)
+        assert (parked.status, parked.block_recurrences, parked.continuation_count) == ("scheduled", 0, 1)
+        assert parked.resume_after is not None
+        run = kb.latest_run(conn, tid)
+        assert (run.outcome, run.summary) == ("checkpointed", "clean checkpoint; wire the next route")
+
+        # A stale worker cannot mutate the parked task, and it is not due early.
+        assert kb.checkpoint_task(conn, tid, summary="stale", expected_run_id=run_id) == (False, False)
+        assert kb.resume_due_checkpoints(conn, now=parked.resume_after - 1) == []
+        assert kb.resume_due_checkpoints(conn, now=parked.resume_after) == [tid]
+        resumed = kb.get_task(conn, tid)
+        assert (resumed.status, resumed.resume_after, resumed.block_recurrences) == ("ready", None, 0)
+
+
+def test_checkpoint_budget_exhaustion_becomes_one_honest_block(kanban_home: Path) -> None:
+    with kbc.connect() as conn:
+        tid = _running_task(conn)
+        for expected_attempt in range(1, kb.DEFAULT_CONTINUATION_LIMIT + 1):
+            run_id = kb.get_task(conn, tid).current_run_id
+            assert kb.checkpoint_task(conn, tid, summary=f"checkpoint {expected_attempt}", delay_seconds=1,
+                                      expected_run_id=run_id) == (True, False)
+            due = kb.get_task(conn, tid).resume_after
+            assert kb.resume_due_checkpoints(conn, now=due) == [tid]
+            assert kb.claim_task(conn, tid, claimer="worker") is not None
+
+        run_id = kb.get_task(conn, tid).current_run_id
+        assert kb.checkpoint_task(conn, tid, summary="still incomplete", expected_run_id=run_id) == (True, True)
+        exhausted = kb.get_task(conn, tid)
+        assert (exhausted.status, exhausted.block_kind, exhausted.continuation_count) == (
+            "blocked", "needs_input", kb.DEFAULT_CONTINUATION_LIMIT + 1)
+        assert [e.kind for e in kb.list_events(conn, tid)][-1] == "blocked"
+
+
+def test_true_block_is_not_resumed_as_a_checkpoint(kanban_home: Path) -> None:
+    with kbc.connect() as conn:
+        tid = _running_task(conn)
+        run_id = kb.get_task(conn, tid).current_run_id
+        assert kb.block_task(conn, tid, reason="credential required", kind="capability", expected_run_id=run_id)
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.resume_due_checkpoints(conn, now=2**31) == []
+
+
+def test_dispatch_resumes_only_due_checkpoint_continuations(kanban_home: Path, all_assignees_spawnable) -> None:
+    spawned: list[str] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawned.append(task.id)
+        return 4242
+
+    with kbc.connect() as conn:
+        tid = _running_task(conn)
+        run_id = kb.get_task(conn, tid).current_run_id
+        assert kb.checkpoint_task(conn, tid, summary="continue wiring", delay_seconds=1,
+                                  expected_run_id=run_id) == (True, False)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET resume_after = 0 WHERE id = ?", (tid,))
+
+        result = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
+        assert result.resumed_checkpoints == [tid]
+        assert spawned == [tid]
+        assert kb.get_task(conn, tid).status == "running"
+
+
 # ---------------------------------------------------------------------------
 # Loop breaker
 # ---------------------------------------------------------------------------
@@ -196,5 +269,3 @@ def test_dependency_block_with_open_parent_stays_parked_across_dispatch_tick(
 # ---------------------------------------------------------------------------
 # Validation + back-compat
 # ---------------------------------------------------------------------------
-
-

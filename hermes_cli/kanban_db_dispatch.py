@@ -110,6 +110,8 @@ class DispatchResult:
 
     reclaimed: int = 0
     promoted: int = 0
+    resumed_checkpoints: list[str] = field(default_factory=list)
+    """Due worker checkpoints returned to the normal ready/todo lifecycle."""
     reconciled_orphans: list[str] = field(default_factory=list)
     """``running`` cards requeued by :func:`reconcile_orphaned_running` (broken
     claim bookkeeping, dead/gone worker)."""
@@ -2206,6 +2208,7 @@ def _run_reclaim_phase(
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
+    result.resumed_checkpoints = _kb.resume_due_checkpoints(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 

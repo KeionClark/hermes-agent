@@ -22,7 +22,7 @@ from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_SCHEMA,
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
-    KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
+    KANBAN_COMPLETE_SCHEMA, KANBAN_CHECKPOINT_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
     KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
 
@@ -109,7 +109,7 @@ def _check_kanban_orchestrator_mode() -> bool:
 # would silently skip the run-ownership CAS in kanban_db. Non-lifecycle tools
 # (heartbeat / attach / attach_url) do not terminate a run and are not gated.
 _RUN_LIFECYCLE_TOOLS = frozenset({
-    "kanban_complete", "kanban_block",
+    "kanban_complete", "kanban_block", "kanban_checkpoint",
     "kanban_request_review", "kanban_request_changes",
 })
 
@@ -813,6 +813,29 @@ def _handle_block(args: dict, **kw) -> str:
         return _ok_landed(kb, conn, tid, "blocked", **extra)
 
 
+@_kanban_handler("kanban_checkpoint")
+def _handle_checkpoint(args: dict, **kw) -> str:
+    """Record bounded progress and schedule the same active card to resume."""
+    tid = _worker_guard("kanban_checkpoint", args)
+    summary = _redact(_require_text(args, "summary", "summary is required"))
+    delay = args.get("delay_seconds", 60)
+    if isinstance(delay, bool) or not isinstance(delay, int):
+        raise _Reject("delay_seconds must be an integer")
+    with _board(args.get("board")) as (kb, conn):
+        ok, exhausted = kb.checkpoint_task(
+            conn, tid, summary=summary, delay_seconds=delay,
+            expected_run_id=_worker_run_id(tid),
+        )
+        _check(ok, f"could not checkpoint {tid} (stale run, not running, or continuation state changed)")
+        task = kb.get_task(conn, tid)
+        return _ok_landed(
+            kb, conn, tid, "blocked" if exhausted else "scheduled",
+            continuation_exhausted=exhausted,
+            resume_after=(task.resume_after if task else None),
+            continuation_count=(task.continuation_count if task else None),
+        )
+
+
 @_kanban_handler("kanban_request_review")
 def _handle_request_review(args: dict, **kw) -> str:
     """Move implementation into the first-class review phase."""
@@ -1223,6 +1246,7 @@ _TOOLS = (
     ("kanban_list", KANBAN_LIST_SCHEMA, _handle_list, "📋"),
     ("kanban_complete", KANBAN_COMPLETE_SCHEMA, _handle_complete, "✔"),
     ("kanban_block", KANBAN_BLOCK_SCHEMA, _handle_block, "⏸"),
+    ("kanban_checkpoint", KANBAN_CHECKPOINT_SCHEMA, _handle_checkpoint, "⏱"),
     ("kanban_request_review", KANBAN_REQUEST_REVIEW_SCHEMA, _handle_request_review, "👀"),
     ("kanban_request_changes", KANBAN_REQUEST_CHANGES_SCHEMA, _handle_request_changes, "↩"),
     ("kanban_heartbeat", KANBAN_HEARTBEAT_SCHEMA, _handle_heartbeat, "💓"),
