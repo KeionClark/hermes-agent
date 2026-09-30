@@ -1938,8 +1938,38 @@ def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[
     return att
 
 
+BLOCK_RESOLUTION_METADATA_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
+# The independent hourly sweep has one full day of scheduling headroom. Earlier
+# deletion still satisfies the approved at-most-30-day retention window.
+BLOCK_RESOLUTION_METADATA_PURGE_AGE_SECONDS = 29 * 24 * 60 * 60
+
+
+def is_expired_block_resolution_metadata(
+    *, kind: str, payload: Optional[dict], created_at: int, now: Optional[int] = None,
+) -> bool:
+    """Whether one resolution audit row is beyond its hard visibility limit."""
+    is_resolution_event = kind == "block_resolved" or (
+        kind == "unblocked" and isinstance(payload, dict) and payload.get("via") == "block_resolved"
+    )
+    return is_resolution_event and int(created_at) <= (
+        int(time.time() if now is None else now) - BLOCK_RESOLUTION_METADATA_MAX_AGE_SECONDS
+    )
+
+
+def _resolution_metadata_sql() -> str:
+    """SQL predicate for the two rows written by ``resolve_block_and_requeue``."""
+    return "(kind = 'block_resolved' OR (kind = 'unblocked' AND payload LIKE '%block_resolved%'))"
+
+
 def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
-    return [Event.from_row(r) for r in _task_rows(conn, "task_events", task_id, "created_at ASC, id ASC")]
+    """Return task events, never exposing expired resolution metadata."""
+    cutoff = int(time.time()) - BLOCK_RESOLUTION_METADATA_MAX_AGE_SECONDS
+    rows = conn.execute(
+        "SELECT * FROM task_events WHERE task_id = ? AND NOT (created_at <= ? AND "
+        + _resolution_metadata_sql() + ") ORDER BY created_at ASC, id ASC",
+        (task_id, cutoff),
+    ).fetchall()
+    return [Event.from_row(r) for r in rows]
 
 
 def _insert_comment(
@@ -4499,7 +4529,10 @@ def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3
     """
     now = int(time.time())
     older_than_seconds = _retention_seconds(older_than_seconds)
-    resolution_cutoff = now - 30 * 24 * 3600
+    # Purge one day before the hard visibility boundary. The dedicated hourly
+    # retention watcher may be delayed, but this leaves a complete cadence of
+    # headroom before any resolution metadata reaches 30 days.
+    resolution_cutoff = now - BLOCK_RESOLUTION_METADATA_PURGE_AGE_SECONDS
     generic_clause = ""
     params: list[Any] = [resolution_cutoff]
     if older_than_seconds:
@@ -4511,8 +4544,7 @@ def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_events WHERE "
-            "(created_at < ? AND (kind = 'block_resolved' OR "
-            "(kind = 'unblocked' AND payload LIKE '%block_resolved%')))"
+            "(created_at <= ? AND " + _resolution_metadata_sql() + ")"
             + generic_clause,
             tuple(params),
         )

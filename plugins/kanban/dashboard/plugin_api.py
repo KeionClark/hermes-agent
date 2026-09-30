@@ -1826,11 +1826,16 @@ class _EventTail:
             "FROM task_events WHERE id > ? ORDER BY id ASC LIMIT 200",
             (cursor,)).fetchall()
         out: list[dict] = []
+        now = int(time.time())
         for r in rows:
             try:
                 payload = json.loads(r["payload"]) if r["payload"] else None
             except Exception:
                 payload = None
+            if kanban_db.is_expired_block_resolution_metadata(
+                kind=r["kind"], payload=payload, created_at=r["created_at"], now=now,
+            ):
+                continue
             out.append({**dict(r), "payload": payload})
         return (rows[-1]["id"] if rows else cursor), out
 

@@ -344,7 +344,15 @@ def unseen_events_for_sub(
     if kind_list:
         params.extend(kind_list)
     rows = conn.execute(q, params).fetchall()
-    out = [_kb.Event.from_row(r) for r in rows]
+    # Keep the durable cursor advancing over expired rows so an old resolution
+    # cannot be read or repeatedly re-scanned after the hard 30-day boundary.
+    out = []
+    for row in rows:
+        event = _kb.Event.from_row(row)
+        if not _kb.is_expired_block_resolution_metadata(
+            kind=event.kind, payload=event.payload, created_at=event.created_at,
+        ):
+            out.append(event)
     max_id = max([cursor, *(int(r["id"]) for r in rows)])
     return max_id, out
 

@@ -34,7 +34,32 @@ from gateway.kanban_watchers_dispatcher import (
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
 _GC_INTERVAL_SECONDS = 3600.0
+_BLOCK_RESOLUTION_METADATA_GC_INTERVAL_SECONDS = 3600.0
 _HEALTH_WINDOW = 6
+
+
+def _purge_block_resolution_metadata(kb: Any) -> int:
+    """Purge every board without relying on dispatch, subscriptions, or adapters."""
+    from hermes_cli import kanban_db_connect as kbc
+
+    total = 0
+    seen_db_paths: set[str] = set()
+    for board_meta in _list_boards(kb):
+        slug = board_meta.get("slug") or kb.DEFAULT_BOARD
+        db_path = board_meta.get("db_path")
+        try:
+            resolved = str(Path(db_path).expanduser().resolve()) if db_path else str(kb.kanban_db_path(slug).resolve())
+        except Exception:
+            resolved = f"slug:{slug}"
+        if resolved in seen_db_paths:
+            continue
+        seen_db_paths.add(resolved)
+        conn = kbc.connect(board=slug)
+        try:
+            total += kb.gc_events(conn, older_than_seconds=0)
+        finally:
+            conn.close()
+    return total
 
 
 class GatewayKanbanWatchersMixin:
@@ -56,6 +81,23 @@ class GatewayKanbanWatchersMixin:
         while slept < interval and self._running:
             await asyncio.sleep(min(1.0, interval - slept))
             slept += 1.0
+
+    async def _kanban_block_resolution_retention_watcher(self) -> None:
+        """Enforce resolution-metadata retention even while dispatch is paused."""
+        try:
+            from hermes_cli import kanban_db as kb
+        except Exception:
+            logger.error("ALERT: kanban block-resolution retention watcher cannot import kanban_db")
+            return
+        while self._running:
+            try:
+                removed = await _to_thread_process_service(_purge_block_resolution_metadata, kb)
+                if removed:
+                    logger.info("kanban retention: purged %d expired block-resolution metadata row(s)", removed)
+            except Exception:
+                # This is a retention-control failure, not ordinary dispatch noise.
+                logger.exception("ALERT: kanban block-resolution metadata retention sweep failed")
+            await self._sleep_between_ticks(_BLOCK_RESOLUTION_METADATA_GC_INTERVAL_SECONDS)
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.

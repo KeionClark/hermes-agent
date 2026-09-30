@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 
 import pytest
 
@@ -143,6 +144,40 @@ def test_resolution_metadata_gc_keeps_generic_history_when_disabled(kanban_home)
         assert kb.gc_events(conn, older_than_seconds=0) == 2
         events = kb.list_events(conn, task_id)
         assert {event.kind for event in events} == {"created", "blocked"}
+
+
+def test_resolution_metadata_is_hidden_at_the_30_day_boundary_before_gc(kanban_home):
+    with kbc.connect() as conn:
+        task_id = _blocked(conn)
+        assert kb.resolve_block_and_requeue(
+            conn, task_id, actor="ops", evidence_ref="case:0123456789abcdef",
+        )
+        boundary = int(time.time()) - kb.BLOCK_RESOLUTION_METADATA_MAX_AGE_SECONDS
+        conn.execute(
+            "UPDATE task_events SET created_at = ? WHERE task_id = ? AND "
+            "(kind = 'block_resolved' OR (kind = 'unblocked' AND payload LIKE '%block_resolved%'))",
+            (boundary, task_id),
+        )
+        conn.commit()
+        assert {event.kind for event in kb.list_events(conn, task_id)} == {"created", "blocked"}
+        assert conn.execute("SELECT count(*) FROM task_events WHERE task_id = ?", (task_id,)).fetchone()[0] == 4
+
+
+def test_resolution_metadata_is_physically_purged_before_the_30_day_limit(kanban_home):
+    with kbc.connect() as conn:
+        task_id = _blocked(conn)
+        assert kb.resolve_block_and_requeue(
+            conn, task_id, actor="ops", evidence_ref="case:0123456789abcdef",
+        )
+        purge_boundary = int(time.time()) - kb.BLOCK_RESOLUTION_METADATA_PURGE_AGE_SECONDS
+        conn.execute(
+            "UPDATE task_events SET created_at = ? WHERE task_id = ? AND "
+            "(kind = 'block_resolved' OR (kind = 'unblocked' AND payload LIKE '%block_resolved%'))",
+            (purge_boundary, task_id),
+        )
+        conn.commit()
+        assert kb.gc_events(conn, older_than_seconds=0) == 2
+        assert {event.kind for event in kb.list_events(conn, task_id)} == {"created", "blocked"}
 
 
 def test_cli_resolve_block_records_opaque_reference_and_profile_actor(kanban_home, monkeypatch):
