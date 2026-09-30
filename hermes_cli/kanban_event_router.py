@@ -208,22 +208,42 @@ def main(argv: list[str] | None = None) -> int:
     import argparse
     from pathlib import Path
     from hermes_cli.kanban_db_connect import connect
+    from hermes_cli.kanban_event_retention import purge_all_expired, require_restricted_board
 
     parser = argparse.ArgumentParser(description="Opt-in DB-only kanban event inbox")
     parser.add_argument("--board-path", type=Path, required=True)
-    parser.add_argument("--subscriber-id", required=True)
-    parser.add_argument("--event-type", action="append", required=True)
+    parser.add_argument("--subscriber-id")
+    parser.add_argument("--event-type", action="append")
+    parser.add_argument("--purge-only", action="store_true",
+                        help="delete expired bus/inbox records without subscribing")
+    parser.add_argument("--retention-batches", type=int, default=100)
     parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument("--interval", type=float, default=0.1)
     parser.add_argument("--max-events", type=int, default=100)
     args = parser.parse_args(argv)
     if not args.board_path.is_file() or args.iterations < 1 or args.iterations > 10000 or args.interval < 0:
         parser.error("board must exist; iterations must be 1..10000; interval must be nonnegative")
-    sub = Subscriber(frozenset(args.event_type), enqueue_inbox(args.subscriber_id))
+    if not args.purge_only and (not args.subscriber_id or not args.event_type):
+        parser.error("subscriber-id and event-type required for routing")
+    if args.retention_batches < 1 or args.retention_batches > 10000:
+        parser.error("retention-batches must be 1..10000")
+    require_restricted_board(args.board_path)
+    if args.event_type and not set(args.event_type) <= {
+        "card.created", "card.blocked", "card.completed", "card.status_changed"
+    }:
+        parser.error("only canonical card lifecycle event types may be routed")
     conn = connect(args.board_path)
     try:
         for iteration in range(args.iterations):
-            run_once(conn, {args.subscriber_id: sub}, max_events=args.max_events)
+            _, _, more = purge_all_expired(
+                conn, max_batches=args.retention_batches)
+            if more:
+                # Never route while the retention backlog may still include
+                # expired rows. A scheduler must retry the bounded drain.
+                raise RuntimeError("retention backlog remains; repeat the purge before routing")
+            if not args.purge_only:
+                sub = Subscriber(frozenset(args.event_type), enqueue_inbox(args.subscriber_id))
+                run_once(conn, {args.subscriber_id: sub}, max_events=args.max_events)
             if iteration + 1 < args.iterations:
                 time.sleep(args.interval)
     finally:
