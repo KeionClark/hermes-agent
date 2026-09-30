@@ -340,8 +340,7 @@ _SPECS = [
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
     _cmd("resolve-block", [
         _TASK_ID,
-        _arg("evidence", nargs="+", help="Evidence that the concrete blocker changed (recorded atomically)"),
-        _arg("--actor", help="Actor accountable for the resolution (default: active profile or user)"),
+        _arg("evidence_ref", nargs="+", help="Opaque case:, run:, or ref: identifier for evidence held outside the board"),
     ], help="Record an evidenced blocked-card resolution and requeue it through parent gates"),
     _cmd("request-review", [
         _TASK_ID,

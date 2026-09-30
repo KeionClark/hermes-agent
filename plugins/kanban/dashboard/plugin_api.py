@@ -832,27 +832,6 @@ class CommentBody(BaseModel):
     author: Optional[str] = "dashboard"
 
 
-class ResolveBlockBody(BaseModel):
-    actor: str
-    evidence: str
-
-
-@router.post("/tasks/{task_id}/resolve-block")
-def resolve_block(task_id: str, payload: ResolveBlockBody, board: Optional[str] = Query(None)):
-    if not payload.actor.strip() or not payload.evidence.strip():
-        raise HTTPException(status_code=400, detail="actor and evidence are required")
-    with _board_conn(board) as (board, conn):
-        _require_task(conn, task_id)
-        with _map_errors(400, ValueError):
-            ok = kanban_db.resolve_block_and_requeue(
-                conn, task_id, actor=payload.actor, evidence=payload.evidence,
-            )
-        if not ok:
-            raise _conflict("Task is not currently blocked or changed during resolution")
-        task = kanban_db.get_task(conn, task_id)
-        return {"task": _task_dict(task) if task else None}
-
-
 @router.post("/tasks/{task_id}/comments")
 def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query(None)):
     if not payload.body.strip():

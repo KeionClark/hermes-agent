@@ -1064,19 +1064,17 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
 def _cmd_resolve_block(args: argparse.Namespace) -> int:
     if os.environ.get("HERMES_KANBAN_TASK"):
         return _err("kanban resolve-block is orchestrator-only; workers must hand off their assigned task")
-    actor = _stripped_or_none(getattr(args, "actor", None)) or _profile_author()
-    evidence = _joined_words(args.evidence)
-    if not evidence.strip():
-        return _err("resolve-block requires non-empty evidence")
+    actor = _profile_author()
+    evidence_ref = _joined_words(args.evidence_ref)
     with kbc.connect_closing() as conn:
         try:
-            ok = kb.resolve_block_and_requeue(conn, args.task_id, actor=actor, evidence=evidence)
+            ok = kb.resolve_block_and_requeue(conn, args.task_id, actor=actor, evidence_ref=evidence_ref)
         except ValueError as exc:
             return _err(str(exc))
         if not ok:
             return _err(f"cannot resolve block {args.task_id} (not currently blocked or status changed)")
         task = kb.get_task(conn, args.task_id)
-        print(f"Resolved {args.task_id} → {task.status} (evidence recorded)")
+        print(f"Resolved {args.task_id} → {task.status} (opaque evidence reference recorded)")
         return 0
 
 
@@ -1403,7 +1401,7 @@ Common subcommands:
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
   `complete <id>…`      Mark task(s) done
   `request-review <id>` Enter first-class review; `request-changes <id> <reason>` returns an active review to its implementer
-  `block <id> [reason]` Mark blocked; `checkpoint <id> <summary>` schedules bounded engineering continuation; `resolve-block <id> <evidence>` records why and requeues
+  `block <id> [reason]` Mark blocked; `checkpoint <id> <summary>` schedules bounded engineering continuation; `resolve-block <id> <reference>` records an opaque reference and requeues
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards
   `assignees`           Known profiles + counts

@@ -38,37 +38,33 @@ def client(tmp_path, monkeypatch):
     return TestClient(app)
 
 
-def test_resolve_block_endpoint_requires_audit_fields_and_requeues(client):
+def test_board_activity_omits_opaque_resolution_reference(client):
     with kbc.connect() as conn:
         task_id = kb.create_task(conn, title="blocked", assignee="builder")
         assert kb.block_task(conn, task_id, reason="need read-only access", kind="capability")
 
-    missing = client.post(f"/api/plugins/kanban/tasks/{task_id}/resolve-block", json={"actor": "ops", "evidence": " "})
-    assert missing.status_code == 400
-    resolved = client.post(
-        f"/api/plugins/kanban/tasks/{task_id}/resolve-block",
-        json={"actor": "ops", "evidence": "read-only path tested"},
-    )
-    assert resolved.status_code == 200
-    assert resolved.json()["task"]["status"] == "ready"
+    with kbc.connect() as conn:
+        assert kb.resolve_block_and_requeue(
+            conn, task_id, actor="release-engineer", evidence_ref="run:0123456789abcdef",
+        )
     board = client.get("/api/plugins/kanban/board").json()
     ready = next(c for c in board["columns"] if c["name"] == "ready")["tasks"]
     row = next(t for t in ready if t["id"] == task_id)
-    assert row["latest_activity"]["kind"] == "comment"
-    assert row["latest_activity"]["text"] == "Block resolved: read-only path tested"
+    assert row["latest_activity"]["kind"] == "event:unblocked"
+    assert row["latest_activity"]["text"] is None
+    rejected = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/resolve-block",
+        json={"actor": "forged", "evidence": "patient text"},
+    )
+    assert rejected.status_code == 404
 
 
 def test_board_activity_preview_is_bounded(client):
-    long_evidence = "x" * 260
     with kbc.connect() as conn:
         task_id = kb.create_task(conn, title="blocked", assignee="builder")
         assert kb.block_task(conn, task_id, reason="need access", kind="capability")
-    response = client.post(
-        f"/api/plugins/kanban/tasks/{task_id}/resolve-block",
-        json={"actor": "ops", "evidence": long_evidence},
-    )
-    assert response.status_code == 200
+        kb.add_comment(conn, task_id, "ops", "x" * 260)
     board = client.get("/api/plugins/kanban/board").json()
-    ready = next(c for c in board["columns"] if c["name"] == "ready")["tasks"]
-    row = next(t for t in ready if t["id"] == task_id)
+    tasks = [task for column in board["columns"] for task in column["tasks"]]
+    row = next(t for t in tasks if t["id"] == task_id)
     assert len(row["latest_activity"]["text"]) == 200

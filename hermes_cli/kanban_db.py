@@ -3711,21 +3711,19 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 def resolve_block_and_requeue(
-    conn: sqlite3.Connection, task_id: str, *, actor: str, evidence: str,
+    conn: sqlite3.Connection, task_id: str, *, actor: str, evidence_ref: str,
 ) -> bool:
-    """Atomically record an evidenced block resolution and requeue one blocked task.
+    """Atomically record an opaque-evidence block resolution and requeue it.
 
-    This is intentionally narrower than :func:`unblock_task`: callers must name the
-    actor and the evidence that changed, and only a currently ``blocked`` task may
-    move. The same parent gate and review-resume semantics apply, while block kind
-    and recurrence history remain intact for any later re-block loop detection.
+    Evidence references are opaque identifiers; evidence text remains in its
+    authorized source and is never copied onto the board.
     """
     actor = (actor or "").strip()
-    evidence = (evidence or "").strip()
+    evidence_ref = (evidence_ref or "").strip()
     if not actor:
         raise ValueError("block resolution actor is required")
-    if not evidence:
-        raise ValueError("block resolution evidence is required")
+    if not re.fullmatch(r"(?:case|run|ref):[0-9a-f]{16,64}", evidence_ref):
+        raise ValueError("evidence reference must be an opaque case:, run:, or ref: identifier")
 
     now = int(time.time())
     with write_txn(conn):
@@ -3734,6 +3732,13 @@ def resolve_block_and_requeue(
         ).fetchone()
         if row is None or row["status"] != "blocked":
             return False
+        invalid_parent = conn.execute(
+            "SELECT l.parent_id FROM task_links l LEFT JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? AND p.id IS NULL LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if invalid_parent is not None:
+            raise ValueError(f"task has invalid parent link: {invalid_parent['parent_id']}")
         resume_status = _resume_status_from_events(conn, task_id)
         _reclaim_dangling_run(
             conn, task_id, statuses=("blocked",), now=now,
@@ -3749,13 +3754,13 @@ def resolve_block_and_requeue(
         )
         if cur.rowcount != 1:
             return False
-        _insert_comment(conn, task_id, actor, f"Block resolved: {evidence}", now)
         _append_event(conn, task_id, "block_resolved", {
             "actor": actor,
-            "evidence": evidence,
+            "evidence_ref": evidence_ref,
             "status": new_status,
             "resume_status": resume_status,
             "block_kind": row["block_kind"],
+            "expires_at": now + 30 * 24 * 3600,
         })
         _append_event(conn, task_id, "unblocked", {
             "status": new_status,
@@ -4489,11 +4494,16 @@ def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3
     ``older_than_seconds=0`` means everything older than now; the CLI maps
     ``--event-retention-days 0`` to "disabled" before calling this.
     """
-    cutoff = int(time.time()) - _retention_seconds(older_than_seconds)
+    now = int(time.time())
+    cutoff = now - _retention_seconds(older_than_seconds)
+    resolution_cutoff = now - 30 * 24 * 3600
     with write_txn(conn):
         cur = conn.execute(
-            "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' AND task_id IN "
-            "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,),
+            "DELETE FROM task_events WHERE "
+            "(kind = 'block_resolved' AND created_at < ?) OR "
+            "(created_at < ? AND kind != 'decomposed' AND task_id IN "
+            "(SELECT id FROM tasks WHERE status IN ('done', 'archived')))",
+            (resolution_cutoff, cutoff),
         )
     return int(cur.rowcount or 0)
 
