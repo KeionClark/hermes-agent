@@ -1696,8 +1696,8 @@ def _has_fenced_checkpoint_resume_after(
             continue
         checkpoint = conn.execute(
             "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'checkpointed' "
-            "AND run_id = ? AND id < ? LIMIT 1",
-            (task_id, run_id, int(event["id"])),
+            "AND run_id = ? AND created_at > ? AND id < ? LIMIT 1",
+            (task_id, run_id, after, int(event["id"])),
         ).fetchone()
         if checkpoint is not None:
             return True
