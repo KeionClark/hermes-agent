@@ -772,6 +772,20 @@ def test_fenced_checkpoint_resume_lifts_active_pr_guard_only_for_same_card(kanba
         assert kb.resume_due_checkpoints(conn, now=scheduled.resume_after) == [task_id]
         assert kbd.check_respawn_guard(conn, task_id) is None
 
+        resumed = kb.claim_task(conn, task_id)
+        assert resumed is not None
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET status = 'failed', outcome = 'crashed', ended_at = ? WHERE id = ?",
+                (int(time.time()), resumed.current_run_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', current_run_id = NULL, claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL WHERE id = ?",
+                (task_id,),
+            )
+        assert kbd.check_respawn_guard(conn, task_id) == "active_pr"
+
         ordinary_id = kb.create_task(conn, title="ordinary PR", assignee="builder")
         kb.add_comment(conn, ordinary_id, author="builder", body="Opened https://github.com/a/b/pull/2")
         _backdate_comments(conn, ordinary_id)

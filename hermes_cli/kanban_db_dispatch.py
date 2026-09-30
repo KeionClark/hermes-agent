@@ -1694,6 +1694,12 @@ def _has_fenced_checkpoint_resume_after(
         ).fetchone()
         if run is None:
             continue
+        latest_run = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if latest_run is None or int(latest_run["id"]) != run_id:
+            continue
         checkpoint = conn.execute(
             "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'checkpointed' "
             "AND run_id = ? AND created_at > ? AND id < ? LIMIT 1",
