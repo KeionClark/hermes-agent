@@ -4489,21 +4489,32 @@ def _retention_seconds(older_than_seconds: int) -> int:
 
 
 def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3600) -> int:
-    """Prune old done/archived events, retaining decomposition identity until task deletion.
+    """Prune expired block-resolution metadata and optional terminal history.
 
-    ``older_than_seconds=0`` means everything older than now; the CLI maps
-    ``--event-retention-days 0`` to "disabled" before calling this.
+    Block-resolution events are strictly retained for 30 days, including the
+    paired ``unblocked`` lifecycle row. This applies while a task is active and
+    cannot be disabled by setting generic event retention to zero. Other
+    terminal-task history follows ``older_than_seconds``; zero disables only
+    that generic sweep.
     """
     now = int(time.time())
-    cutoff = now - _retention_seconds(older_than_seconds)
+    older_than_seconds = _retention_seconds(older_than_seconds)
     resolution_cutoff = now - 30 * 24 * 3600
+    generic_clause = ""
+    params: list[Any] = [resolution_cutoff]
+    if older_than_seconds:
+        generic_clause = (
+            " OR (created_at < ? AND kind != 'decomposed' AND task_id IN "
+            "(SELECT id FROM tasks WHERE status IN ('done', 'archived')))"
+        )
+        params.append(now - older_than_seconds)
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_events WHERE "
-            "(kind = 'block_resolved' AND created_at < ?) OR "
-            "(created_at < ? AND kind != 'decomposed' AND task_id IN "
-            "(SELECT id FROM tasks WHERE status IN ('done', 'archived')))",
-            (resolution_cutoff, cutoff),
+            "(created_at < ? AND (kind = 'block_resolved' OR "
+            "(kind = 'unblocked' AND payload LIKE '%block_resolved%')))"
+            + generic_clause,
+            tuple(params),
         )
     return int(cur.rowcount or 0)
 

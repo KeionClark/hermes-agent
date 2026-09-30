@@ -125,13 +125,24 @@ def test_resolution_metadata_expires_after_30_days_while_task_is_active(kanban_h
         assert kb.resolve_block_and_requeue(
             conn, task_id, actor="ops", evidence_ref="case:0123456789abcdef",
         )
-        conn.execute(
-            "UPDATE task_events SET created_at = 0 WHERE task_id = ? AND kind = 'block_resolved'",
-            (task_id,),
-        )
+        conn.execute("UPDATE task_events SET created_at = 0 WHERE task_id = ?", (task_id,))
         conn.commit()
-        assert kb.gc_events(conn, older_than_seconds=30 * 24 * 3600) == 1
+        assert kb.gc_events(conn, older_than_seconds=30 * 24 * 3600) == 2
         assert not any(e.kind == "block_resolved" for e in kb.list_events(conn, task_id))
+
+
+def test_resolution_metadata_gc_keeps_generic_history_when_disabled(kanban_home):
+    """The daily safety sweep cannot be disabled with the generic CLI flag."""
+    with kbc.connect() as conn:
+        task_id = _blocked(conn)
+        assert kb.resolve_block_and_requeue(
+            conn, task_id, actor="ops", evidence_ref="case:0123456789abcdef",
+        )
+        conn.execute("UPDATE task_events SET created_at = 0 WHERE task_id = ?", (task_id,))
+        conn.commit()
+        assert kb.gc_events(conn, older_than_seconds=0) == 2
+        events = kb.list_events(conn, task_id)
+        assert {event.kind for event in events} == {"created", "blocked"}
 
 
 def test_cli_resolve_block_records_opaque_reference_and_profile_actor(kanban_home, monkeypatch):

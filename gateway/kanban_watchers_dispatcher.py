@@ -128,11 +128,13 @@ class _KanbanDispatcher:
     """
 
     CORRUPT_BOARD_RETRY_AFTER_SECONDS = 300
+    BLOCK_RESOLUTION_GC_INTERVAL_SECONDS = 24 * 60 * 60
 
     def __init__(self, kb: Any, settings: _DispatcherSettings) -> None:
         self.kb = kb
         self.settings = settings
         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
+        self.block_resolution_gc_next_at: dict[str, float] = {}
 
     def _board_slugs(self) -> list:
         return _board_slugs(self.kb)
@@ -186,6 +188,20 @@ class _KanbanDispatcher:
             # No explicit init_db(): connect() runs the migration once per
             # process (see the matching note in the notifier collector).
             conn = _kbc().connect(board=slug)
+            due_at = self.block_resolution_gc_next_at.get(slug, 0.0)
+            if time.monotonic() >= due_at:
+                try:
+                    removed = self.kb.gc_events(conn, older_than_seconds=0)
+                except Exception:
+                    logger.exception("kanban dispatcher: block-resolution metadata GC failed on board %s", slug)
+                else:
+                    self.block_resolution_gc_next_at[slug] = (
+                        time.monotonic() + self.BLOCK_RESOLUTION_GC_INTERVAL_SECONDS
+                    )
+                    logger.info(
+                        "kanban dispatcher: block-resolution metadata GC on board %s removed %d row(s)",
+                        slug, removed,
+                    )
             return _kbd().dispatch_once(conn, board=slug, **kwargs)
         except Exception as exc:
             if self.is_corrupt_board_db_error(exc):
