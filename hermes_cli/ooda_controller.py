@@ -22,6 +22,7 @@ import logging
 import sqlite3
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli import event_bus
@@ -36,7 +37,6 @@ _log = logging.getLogger(__name__)
 # Event types the controller subscribes to.
 _OBSERVE_EVENTS: frozenset[str] = frozenset({
     "goal.gap_detected",
-    "metric.threshold_crossed",
     "run.completed",
 })
 
@@ -72,8 +72,8 @@ def _observe(
 ) -> list[event_bus.Event]:
     """Poll metadata-only events from the bus for a registered subscriber.
 
-    Board confinement: the subscriber must have been registered on the same
-    DB as ``permitted_board``; this function does NOT open a second connection.
+    The caller verifies the connection's board before subscribing; this
+    function does not open a second connection.
     Returns at most ``max_events`` events in ascending id order.
     """
     events = event_bus.poll(conn, subscriber_id, limit=max_events)
@@ -356,7 +356,7 @@ def run_once(
     max_events: int = 50,
     max_active_acts: int = 2,
     permitted_board: str,
-    assignee: str = "researcher-a",
+    assignee: str = "default",
     tenant: Optional[str] = None,
     now: Optional[float] = None,
 ) -> OodaResult:
@@ -410,6 +410,19 @@ def run_once(
         raise ValueError("subscriber_id must be a non-empty string")
     if not permitted_board or not isinstance(permitted_board, str):
         raise ValueError("permitted_board must be a non-empty string")
+    # Verify the actual opened database, not a caller-supplied label.  Both
+    # reads and writes stay on this very connection; no implicit board switch.
+    dbs = conn.execute("PRAGMA database_list").fetchall()
+    main_files = [row[2] for row in dbs if row[1] == "main"]
+    if len(main_files) != 1 or not main_files[0] or not Path(permitted_board).is_file():
+        raise ValueError("permitted_board must name the opened file board")
+    if Path(main_files[0]).resolve() != Path(permitted_board).resolve():
+        raise ValueError("permitted_board does not match connection")
+    # A ready card for an unserved profile is a stranded card.  Use the same
+    # profile liveness predicate as the dispatcher, before subscription/ACK.
+    from hermes_cli.profiles import profile_exists
+    if not isinstance(assignee, str) or not profile_exists(assignee):
+        raise ValueError("assignee must be an existing live profile")
 
     if now is None:
         now = time.time()
@@ -455,7 +468,7 @@ def run_once(
             events_processed += 1
             continue
 
-        if evt.event_type in ("goal.gap_detected", "metric.threshold_crossed"):
+        if evt.event_type == "goal.gap_detected":
             action_context = _orient_gap(conn, evt, now=now)
             if action_context is None:
                 # No-op: gap not verified active/fresh.
@@ -468,25 +481,26 @@ def run_once(
             # --- Decide ---
             # Capacity, rights, card insertion and ACK share one IMMEDIATE write
             # transaction. A second controller cannot race the capacity read.
+            deferred_for_capacity = False
             with write_txn(conn):
-                active_count = _count_active_ooda_acts(conn)
-                should_act, reason = _decide(
-                    action_context,
-                    max_active_acts=max_active_acts,
-                    active_count=active_count,
+                idem_key = _stable_idempotency_key(
+                    action_context["goal_id"],
+                    action_context["metric_id"],
+                    action_context["event_id"],
                 )
-                if should_act:
-                    idem_key = _stable_idempotency_key(
-                        action_context["goal_id"],
-                        action_context["metric_id"],
-                        action_context["event_id"],
+                existing = conn.execute(
+                    "SELECT id FROM tasks WHERE idempotency_key = ?", (idem_key,),
+                ).fetchone()
+                if existing:
+                    acts_deduplicated += 1
+                else:
+                    active_count = _count_active_ooda_acts(conn)
+                    should_act, reason = _decide(
+                        action_context,
+                        max_active_acts=max_active_acts,
+                        active_count=active_count,
                     )
-                    existing = conn.execute(
-                        "SELECT id FROM tasks WHERE idempotency_key = ?", (idem_key,),
-                    ).fetchone()
-                    if existing:
-                        acts_deduplicated += 1
-                    else:
+                    if should_act:
                         task_id = _act_create_investigation(
                             conn, action_context,
                             assignee=assignee,
@@ -496,10 +510,16 @@ def run_once(
                         if task_id is None:
                             raise RuntimeError("investigation card not persisted; keep event pending")
                         acts_created += 1
-                else:
-                    events_skipped += 1
-                    noop_reasons.append(f"decide_no:{reason}:{evt.id}")
-                event_bus.ack(conn, subscriber_id, evt.id)
+                    else:
+                        events_skipped += 1
+                        noop_reasons.append(f"decide_no:{reason}:{evt.id}")
+                        deferred_for_capacity = reason == "at_capacity"
+                if not deferred_for_capacity:
+                    event_bus.ack(conn, subscriber_id, evt.id)
+            if deferred_for_capacity:
+                # Keep the first unserved edge pending, in order, until a
+                # terminal run frees a slot. ACK would lose it forever.
+                break
             events_processed += 1
             continue
 

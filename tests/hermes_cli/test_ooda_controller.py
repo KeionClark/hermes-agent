@@ -250,7 +250,7 @@ class TestSubscription:
 
     def test_observe_events_includes_gap_and_run_completed(self):
         assert "goal.gap_detected" in _OBSERVE_EVENTS
-        assert "metric.threshold_crossed" in _OBSERVE_EVENTS
+        assert "metric.threshold_crossed" not in _OBSERVE_EVENTS
         assert "run.completed" in _OBSERVE_EVENTS
 
     def test_subscriber_registration(self):
@@ -307,15 +307,17 @@ class TestBusToGapToAct:
             # The breached measurement should have emitted goal.gap_detected
             # and metric.threshold_crossed on the bus.
             assert not meas_result.is_replay
-            assert len(meas_result.events) >= 1
+            assert {e["event_type"] for e in meas_result.events} == {
+                "goal.gap_detected", "metric.threshold_crossed"
+            }
 
             # Register subscriber BEFORE events (start='beginning' to catch them).
             subscribe(conn, "test-gap-act", event_types=_OBSERVE_EVENTS, start="beginning")
 
             # Verify events are visible.
             events = poll(conn, "test-gap-act", limit=100)
-            gap_events = [e for e in events if e.event_type in ("goal.gap_detected", "metric.threshold_crossed")]
-            assert len(gap_events) >= 1, f"Expected gap events, got: {[e.event_type for e in events]}"
+            gap_events = [e for e in events if e.event_type == "goal.gap_detected"]
+            assert len(gap_events) == 1, f"Expected one actionable edge, got: {[e.event_type for e in events]}"
 
             # Run OODA.
             result = run_once(
@@ -323,10 +325,10 @@ class TestBusToGapToAct:
                 subscriber_id="test-gap-act",
                 max_events=10,
                 permitted_board=db_path,
-                assignee="researcher-a",
+                assignee="default",
             )
 
-            assert result.acts_created >= 1
+            assert result.acts_created == 1
             assert result.events_processed + result.events_skipped >= 1
 
             # Verify investigation card was created with correct idempotency key.
@@ -334,7 +336,8 @@ class TestBusToGapToAct:
                 "SELECT * FROM tasks WHERE idempotency_key LIKE 'ooda:investigate:%'"
             ).fetchone()
             assert row is not None
-            assert row["assignee"] == "researcher-a"
+            assert row["assignee"] == "default"
+            assert conn.execute("SELECT COUNT(*) FROM tasks WHERE idempotency_key LIKE 'ooda:investigate:%'").fetchone()[0] == 1
             assert "Investigate" in row["title"]
         finally:
             conn.close()
@@ -1017,3 +1020,51 @@ class TestPublisherEmitRunCompleted:
         finally:
             conn.close()
             os.unlink(db_path)
+
+
+class TestLogicalEdgeAndAdmission:
+    def test_recovery_rebreach_and_restart_at_full_capacity(self):
+        conn, db_path = _disposable_board()
+        try:
+            goal_id = _create_active_goal(conn)
+            subscribe(conn, "edges", event_types=_OBSERVE_EVENTS, start="beginning")
+            first = _record_breached_measurement(conn, goal_id, idem_key="edge-1")
+            assert run_once(conn, subscriber_id="edges", max_active_acts=1, permitted_board=db_path).acts_created == 1
+            subscribe(conn, "restart", event_types=_OBSERVE_EVENTS, start="beginning")
+            replay = run_once(conn, subscriber_id="restart", max_active_acts=1, permitted_board=db_path)
+            assert (replay.acts_created, replay.acts_deduplicated) == (0, 1)
+            healthy = _record_breached_measurement(conn, goal_id, value=3, idem_key="healthy")
+            assert {e["event_type"] for e in healthy.events} == {"goal.achieved"}
+            second = _record_breached_measurement(conn, goal_id, idem_key="edge-2")
+            assert {e["event_type"] for e in second.events} == {
+                "goal.gap_detected", "metric.threshold_crossed"
+            }
+            assert first.events[0]["event_id"] != second.events[0]["event_id"]
+            assert run_once(conn, subscriber_id="edges", max_active_acts=1, permitted_board=db_path).acts_created == 0
+            conn.execute("UPDATE tasks SET status = 'done' WHERE idempotency_key LIKE 'ooda:investigate:%'")
+            # The original subscriber retains the unserved edge until release.
+            assert run_once(conn, subscriber_id="edges", max_active_acts=1,
+                            permitted_board=db_path).acts_created == 1
+            assert conn.execute("SELECT COUNT(*) FROM tasks WHERE idempotency_key LIKE 'ooda:investigate:%'").fetchone()[0] == 2
+        finally:
+            conn.close()
+            os.unlink(db_path)
+
+    def test_file_board_mismatch_and_invalid_assignee_fail_before_subscribe(self):
+        conn, db_path = _disposable_board()
+        other, other_path = _disposable_board()
+        try:
+            goal_id = _create_active_goal(conn)
+            _record_breached_measurement(conn, goal_id, idem_key="admission")
+            with pytest.raises(ValueError, match="permitted_board"):
+                run_once(conn, subscriber_id="wrong-board", permitted_board=other_path)
+            with pytest.raises(ValueError, match="assignee"):
+                run_once(conn, subscriber_id="wrong-profile", permitted_board=db_path,
+                         assignee="profile-that-does-not-exist")
+            assert conn.execute("SELECT COUNT(*) FROM tasks WHERE idempotency_key LIKE 'ooda:investigate:%'").fetchone()[0] == 0
+            assert conn.execute("SELECT COUNT(*) FROM hermes_event_cursors").fetchone()[0] == 0
+        finally:
+            conn.close()
+            other.close()
+            os.unlink(db_path)
+            os.unlink(other_path)
