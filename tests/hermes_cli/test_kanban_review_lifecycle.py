@@ -929,3 +929,162 @@ def test_synthesized_run_for_unassigned_card_keeps_null_profile(kanban_home: Pat
             "SELECT profile, outcome FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (tid,),
         ).fetchone()
         assert (run["outcome"], run["profile"]) == ("blocked", None)
+
+
+# ---------------------------------------------------------------------------
+# Dependency-cleared same-card release continuation (#t_2154c703)
+# ---------------------------------------------------------------------------
+
+
+def test_active_pr_guard_lifts_after_dependency_cleared_promotion(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exact timeline from t_2074a464: worker opens PR, blocks on QA parents,
+    parents complete, ``recompute_ready`` promotes the card back to ``ready``
+    — the ``active_pr`` guard must not starve this continuation.
+
+    Steps:
+    1. Create parent (QA) and child (release) tasks with a link.
+    2. Child worker runs, posts a PR comment, then blocks kind=dependency.
+    3. Parent completes → ``recompute_ready`` promotes child → ``promoted`` event.
+    4. ``check_respawn_guard`` must return None (guard lifted).
+    5. ``dispatch_once`` must spawn the child.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
+    pr_comment = "Opened https://github.com/example/repo/pull/121 for review."
+
+    with kbc.connect() as conn:
+        # Create parent (QA) and child (release) — no link yet so the child
+        # can be claimed first (simulating a task that ran, PR'd, then had
+        # a dependency added or discovered).
+        qa_id = kb.create_task(conn, title="QA pass", assignee="qa")
+        release_id = kb.create_task(
+            conn, title="release v1", assignee="release-eng",
+        )
+
+        # Child claims, runs, posts PR.
+        claimed = kb.claim_task(conn, release_id)
+        assert claimed is not None
+        kb.add_comment(conn, release_id, author="release-eng", body=pr_comment)
+        _backdate_comments(conn, release_id, seconds=120)
+
+        # Now the worker realizes it needs QA first and blocks on dependency.
+        # Add the parent link first so the dependency block can gate on it.
+        kb.link_tasks(
+            conn, parent_id=qa_id, child_id=release_id,
+            expected_child_run_id=claimed.current_run_id,
+        )
+
+        # Worker blocks with kind=dependency (back to todo + dependency_wait event).
+        ok = kb.block_task(conn, release_id, reason="waiting for QA", kind="dependency")
+        assert ok is True
+        assert kb.get_task(conn, release_id).status == "todo"
+        dep_events = _events(conn, release_id, kind="dependency_wait")
+        assert len(dep_events) >= 1
+
+        # Before QA completes, the guard should hold (no promotion yet).
+        # The task is in todo so the guard isn't directly tested on the ready
+        # lane, but we can still probe it:
+        assert kbd.check_respawn_guard(conn, release_id) == "active_pr"
+
+        # QA parent completes → complete_task internally calls
+        # recompute_ready which promotes child.
+        kb.claim_task(conn, qa_id)
+        assert kb.complete_task(conn, qa_id, summary="QA passed") is True
+        assert kb.get_task(conn, release_id).status == "ready"
+        assert len(_events(conn, release_id, kind="promoted")) >= 1
+
+        # NOW the guard should lift — dependency-cleared promotion after PR comment.
+        assert kbd.check_respawn_guard(conn, release_id) is None
+
+        # Dispatch should spawn it.
+        res = kbd.dispatch_once(conn, dry_run=True)
+        spawned_ids = [s[0] for s in res.spawned]
+        assert release_id in spawned_ids
+        guarded = dict(res.respawn_guarded)
+        assert release_id not in guarded
+
+
+def test_active_pr_guard_holds_when_promoted_without_dependency_wait(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Decoy: a ``promoted`` event exists after the PR comment but there was
+    never a ``dependency_wait`` — the promotion came from a manual
+    ``done→ready`` drag or some other non-dependency path. The guard must
+    still hold because this is not a release continuation.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
+    pr_comment = "Opened https://github.com/example/repo/pull/200 for review."
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="decoy promotion", assignee="dev")
+        kb.add_comment(conn, tid, author="dev", body=pr_comment)
+        _backdate_comments(conn, tid, seconds=120)
+
+        # Inject a promoted event WITHOUT any dependency_wait.
+        import time as _time
+        _now = int(_time.time())
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, 'promoted', NULL, ?)",
+                (tid, _now),
+            )
+
+        # Guard should still hold — no dependency_wait means this wasn't
+        # a dependency-cleared continuation.
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+        # Dispatch confirms.
+        res = kbd.dispatch_once(conn, dry_run=True)
+        assert dict(res.respawn_guarded).get(tid) == "active_pr"
+
+
+def test_active_pr_guard_holds_when_parent_reopened_after_promotion(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Edge case: dependency-cleared promotion happened but a parent was
+    subsequently reopened (moved back to running). The guard must hold
+    because parents are no longer satisfied — fail closed.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
+    pr_comment = "Opened https://github.com/example/repo/pull/130 for review."
+
+    with kbc.connect() as conn:
+        qa_id = kb.create_task(conn, title="QA pass 2", assignee="qa")
+        release_id = kb.create_task(
+            conn, title="release v2", assignee="release-eng",
+        )
+        # Claim, PR, then link + dependency block, QA done, promote.
+        claimed = kb.claim_task(conn, release_id)
+        kb.add_comment(conn, release_id, author="release-eng", body=pr_comment)
+        _backdate_comments(conn, release_id, seconds=120)
+        kb.link_tasks(
+            conn, parent_id=qa_id, child_id=release_id,
+            expected_child_run_id=claimed.current_run_id,
+        )
+        kb.block_task(conn, release_id, reason="waiting for QA", kind="dependency")
+        kb.claim_task(conn, qa_id)
+        kb.complete_task(conn, qa_id, summary="QA passed")
+        assert kb.get_task(conn, release_id).status == "ready"
+
+        # Parent gets reopened (simulate by moving back to running).
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'running' WHERE id = ?", (qa_id,),
+            )
+
+        # Guard should hold — parents not satisfied.
+        assert kbd.check_respawn_guard(conn, release_id) == "active_pr"

@@ -1545,7 +1545,7 @@ def check_respawn_guard(
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
     handoff event followed the comment: the named profile must work on that
-    PR). The review lane skips the last two: they are the *inputs* to a review
+    PR, or a dependency-cleared promotion followed — same release continuation). The review lane skips the last two: they are the *inputs* to a review
     handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
     passes own those.
     """
@@ -1631,6 +1631,10 @@ def check_respawn_guard(
     #    now work on THAT PR — a closer or the implementer finishing it, not a
     #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
     #    so the worker that opened the PR is still not re-spawned against it.
+    #    Also exempted: a dependency-cleared promotion after the PR comment
+    #    (the task was parked in dependency_wait, parents finished, and
+    #    recompute_ready promoted it back to ready — same release continuation,
+    #    not a new attempt).
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
         "SELECT body, created_at FROM task_comments "
@@ -1650,6 +1654,8 @@ def check_respawn_guard(
         if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
             return None
         if _has_fenced_checkpoint_resume_after(conn, task_id, int(c["created_at"] or 0)):
+            return None
+        if _has_dependency_cleared_promotion_after(conn, task_id, int(c["created_at"] or 0)):
             return None
         return "active_pr"
 
@@ -1716,6 +1722,44 @@ def _has_fenced_checkpoint_resume_after(
         if checkpoint is not None:
             return True
     return False
+
+
+def _has_dependency_cleared_promotion_after(
+    conn: sqlite3.Connection, task_id: str, after: int,
+) -> bool:
+    """True when the task was dependency-waiting and then promoted after ``after``.
+
+    Timeline: a worker opened a PR, then (same or later run) blocked on a
+    dependency (QA parents, etc.).  ``recompute_ready`` promoted the task
+    back to ``ready`` once parents finished — a same-card release
+    continuation, not a new implementation attempt.  The guard requires:
+
+    1. A ``dependency_wait`` event exists for the task (it actually waited).
+    2. A ``promoted`` event exists strictly after ``after`` (the PR comment).
+    3. The ``dependency_wait`` was recorded at or before the ``promoted``
+       (the promotion resulted from the wait clearing, not something else).
+    4. All parents are currently satisfied (done/archived) — fail closed if
+       a parent reopened after the promotion.
+    """
+    promoted = conn.execute(
+        "SELECT id, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'promoted' AND created_at > ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, after),
+    ).fetchone()
+    if promoted is None:
+        return False
+    # Verify a dependency_wait preceded the promotion.
+    dep_wait = conn.execute(
+        "SELECT 1 FROM task_events "
+        "WHERE task_id = ? AND kind = 'dependency_wait' "
+        "AND created_at <= ? LIMIT 1",
+        (task_id, int(promoted["created_at"])),
+    ).fetchone()
+    if dep_wait is None:
+        return False
+    # Fail closed: parents must still be satisfied right now.
+    return _kb._parents_satisfied(conn, task_id)
 
 
 def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
