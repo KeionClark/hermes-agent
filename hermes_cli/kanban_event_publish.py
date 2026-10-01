@@ -11,6 +11,8 @@ Event types
   in-place reclassification, dependency ``todo``, or loop ``triage``.
 - ``card.completed``     — once on successful transition to ``done``
   (complete_task, swarm inline, dashboard direct done).
+- ``run.completed``      — once on successful terminal close of an actual or
+  explicitly synthesized Kanban task run (including failures/reclaims).
 - ``card.status_changed``— every actual status transition: dispatcher
   claim/reclaim/timeout/crash, link/unlink/promote/demote, review/request_changes,
   unblock/reopen/triage/archive, direct dashboard and swarm.
@@ -20,6 +22,7 @@ Payload contract (privacy-safe, no PII/PHI):
     ``card.created``:        ``{task_id, run_id}``
     ``card.blocked``:        ``{task_id, run_id, block_kind}``
     ``card.completed``:      ``{task_id, run_id}``
+    ``run.completed``:       ``{task_id, run_id, outcome}`` (no summary/error/metadata)
 
 No idempotency key: each guarded CAS mutation fires once; router dedupes by
 ``event.id``.
@@ -180,9 +183,10 @@ def emit_run_completed(
 
     Payload is restricted to the allowlisted triple {task_id, run_id, outcome}.
     This is a NEW event type — no pre-existing ``run.completed`` exists in the
-    Kanban bus (the gateway SSE ``run.completed`` is unrelated).  Integration
-    owner must wire calls at each ``_end_run`` site in kanban_db.py and
-    kanban_db_dispatch.py (see call-site map in task handoff).
+    Kanban bus (the gateway SSE ``run.completed`` is unrelated).  The
+    lifecycle owner publishes from ``_end_run`` / ``_synthesize_ended_run``
+    inside the mutation's write transaction, covering dispatcher, dashboard
+    and swarm paths without separate per-caller emissions.
     """
     payload: dict = {"task_id": task_id}
     if run_id is not None:
