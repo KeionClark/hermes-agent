@@ -621,9 +621,14 @@ class TestEvaluateDueOutcome:
 
         # Record measurement that will be stale by evaluation time.
         after_ts = completed + 10
-        _record_measurement(
-            conn, value=75.0,
-            source_timestamp=after_ts, observed_at=after_ts,
+        # Direct insert models an overdue fallback scan without triggering the
+        # ordinary event-driven evaluation at observation time.
+        conn.execute(
+            "INSERT INTO goal_measurements (goal_id, metric_id, value, source_id, "
+            "source_timestamp, observed_at, source_ref, idempotency_key, "
+            "edge_state, created_at, metric_version) "
+            "VALUES ('test-goal','test.metric',75,'test_source',?,?,'ref',"
+            "'stale-after','healthy',?,1)", (after_ts, after_ts, after_ts),
         )
 
         # Evaluate much later so the measurement is stale.
@@ -635,7 +640,7 @@ class TestEvaluateDueOutcome:
         assert result is None
 
     def test_absent_before_fails_closed_falsified(self):
-        """No before measurement -> fail closed -> falsified."""
+        """No before measurement remains pending; it cannot prove failure."""
         conn = _fresh_db()
         _make_active_goal(conn)
         started = time.time()
@@ -662,11 +667,8 @@ class TestEvaluateDueOutcome:
         result = evaluate_due_outcome(conn, outcome.id, now=after_ts + 1)
         _commit(conn)
 
-        assert result is not None
-        assert result.status == "falsified"
-        assert result.effect is None
-        assert result.confidence_delta is None
-        assert result.after_value == 75.0
+        assert result is None
+        assert conn.execute("SELECT status FROM outcomes WHERE id = ?", (outcome.id,)).fetchone()[0] == "awaiting_remeasure"
 
     def test_idempotent_evaluate_returns_same(self):
         """Evaluating an already-evaluated outcome returns existing record."""
@@ -718,21 +720,11 @@ class TestEvaluateDueOutcome:
             conn, before_value=50.0, expected_direction="higher",
         )
 
-        # Record valid after measurement.
-        after_ts = completed + 10
-        _record_measurement(
-            conn, value=75.0,
-            source_timestamp=after_ts, observed_at=after_ts,
-        )
-
-        # Mutate the goal's metric_version behind the outcome's back.
-        conn.execute(
-            "UPDATE goals SET metric_version = 2 WHERE id = 'test-goal'"
-        )
-
+        # Change definition before the after reading is persisted.
+        conn.execute("UPDATE goals SET metric_version = 2 WHERE id = 'test-goal'")
         with pytest.raises(ValueError, match="metric_version changed"):
             _begin(conn)
-            evaluate_due_outcome(conn, outcome.id, now=after_ts + 1)
+            evaluate_due_outcome(conn, outcome.id, now=completed + 11)
 
     def test_wrong_source_id_not_matched(self):
         """Measurement with wrong source_id is not used as after."""
@@ -878,17 +870,13 @@ class TestEvaluateDueOutcome:
         result = evaluate_due_outcome(conn, outcome.id, now=after_ts + 1)
         _commit(conn)
 
-        # Falsified (no before), but after_metric_id should be set from the
-        # after measurement, so event SHOULD still be emitted.
-        assert result.status == "falsified"
-        assert result.after_metric_id == "test.metric"
+        assert result is None
 
         evt = conn.execute(
             "SELECT * FROM hermes_events "
             "WHERE event_type = 'outcome.evaluated'"
         ).fetchone()
-        # Event should be emitted because after_metric_id is available.
-        assert evt is not None
+        assert evt is None
 
 
 # ---------------------------------------------------------------------------

@@ -43,6 +43,8 @@ fails closed with `GoalSchemaNotInitializedError` before that opt-in.
   raised (fail-closed; the binary is too old).
 - **Idempotent**: Re-running migration on an already-current DB is a no-op.
 - **Fresh + legacy**: Works on both new DBs and existing boards.
+- **Version 2**: Adds nullable `goal_measurements.metric_version`; historical
+  readings stay NULL (unknown), never backfilled from the current goal.
 - **Does not alter**: `task_events`, `tasks`, or the notifier.
 
 ## Goals
@@ -95,6 +97,7 @@ fails closed with `GoalSchemaNotInitializedError` before that opt-in.
 | edge_state | TEXT | `unknown`, `healthy`, `breached` |
 | gap_value | REAL | Signed gap at time of measurement |
 | created_at | REAL | Unix timestamp |
+| metric_version | INTEGER NULL | Definition at observation; NULL is unproven legacy |
 
 ### Validation (Fail-Closed)
 
@@ -114,6 +117,17 @@ All invalid inputs are rejected — no measurements on snapshot failure:
   without re-evaluation
 - **Conflicting key**: Same idempotency_key with different payload_hash fails
   closed (no silent overwrite)
+
+### Dark P2 integration
+
+On explicitly migrated disposable boards, each eligible reading (even without
+a gap-edge transition) re-evaluates up to 50 awaiting outcomes in the caller's
+write transaction. Verdict, safe `outcome.evaluated` event and comparable
+proposal confidence adjustment commit together or all roll back. Missing or
+unversioned baselines, stale/foreign/unversioned after readings and definition
+drift cannot confirm. `evaluate_due_batch` is an explicit bounded safety-net
+scan, not the primary driver. `propose_gap_once` consumes opted-in gap events
+with caller-supplied inert candidates; neither activates the canonical board.
 
 ## Gap Evaluation
 

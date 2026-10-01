@@ -22,15 +22,10 @@ event_bus.py, ooda_controller.py, or proposal_queue.py.
 
 metric_version handling
 ~~~~~~~~~~~~~~~~~~~~~~~
-``goal_measurements`` does not carry a ``metric_version`` column (see
-goal_metrics.py schema lines 155-175).  We therefore cannot know an old
-measurement's version after the fact.  Instead, the outcome row snapshots
-the goal's ``metric_version`` at creation time (``goal_metric_version``),
-and ``evaluate_due_outcome`` fails closed if the goal's live
-``metric_version`` has changed since creation — the before/after comparison
-is invalid when the metric definition changed under it.  Adding
-``metric_version`` to ``goal_measurements`` is a provenance extension owned
-by the integration layer, not this module.
+Goal schema V2 records the definition on each new measurement. Legacy rows
+have NULL version and cannot serve as a comparable baseline or after reading.
+Outcome schema V2 stores the checked before/after versions alongside the
+goal's version at action creation; definition drift fails closed.
 
 Event payload
 ~~~~~~~~~~~~~
@@ -59,7 +54,7 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_OUTCOME_SCHEMA_VERSION = 1
+_OUTCOME_SCHEMA_VERSION = 2
 
 OutcomeStatus = Literal[
     "pending",              # action created, not yet completed
@@ -80,9 +75,8 @@ ExpectedDirection = Literal["higher", "lower"]
 class MeasurementSnapshot:
     """Immutable copy of provenance fields from a goal_measurements row.
 
-    Does NOT include metric_version — that column does not exist on
-    goal_measurements.  The goal's metric_version is snapshotted
-    separately in the outcome row at creation time.
+    The checked definition version is stored on the outcome alongside this
+    snapshot; legacy NULL measurement versions are not comparable.
     """
 
     measurement_id: int
@@ -113,6 +107,7 @@ class Outcome:
     before_observed_at: Optional[float]
     before_source_ref: Optional[str]
     before_metric_id: Optional[str]
+    before_metric_version: Optional[int]
     after_measurement_id: Optional[int]
     after_value: Optional[float]
     after_source_id: Optional[str]
@@ -120,6 +115,7 @@ class Outcome:
     after_observed_at: Optional[float]
     after_source_ref: Optional[str]
     after_metric_id: Optional[str]
+    after_metric_version: Optional[int]
     settling_seconds: int
     started_at: float
     completed_at: Optional[float]
@@ -160,6 +156,7 @@ CREATE TABLE IF NOT EXISTS outcomes (
     before_observed_at      REAL,
     before_source_ref       TEXT,
     before_metric_id        TEXT,
+
     after_measurement_id    INTEGER,
     after_value             REAL,
     after_source_id         TEXT,
@@ -167,6 +164,7 @@ CREATE TABLE IF NOT EXISTS outcomes (
     after_observed_at       REAL,
     after_source_ref        TEXT,
     after_metric_id         TEXT,
+
     settling_seconds        INTEGER NOT NULL CHECK (settling_seconds >= 0),
     started_at              REAL NOT NULL,
     completed_at            REAL,
@@ -266,8 +264,13 @@ def migrate_outcome_schema(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "INSERT OR REPLACE INTO outcome_schema_version "
                 "(id, version) VALUES (1, ?)",
-                (_OUTCOME_SCHEMA_VERSION,),
+                (1,),
             )
+
+        if current < 2:
+            conn.execute("ALTER TABLE outcomes ADD COLUMN before_metric_version INTEGER")
+            conn.execute("ALTER TABLE outcomes ADD COLUMN after_metric_version INTEGER")
+            conn.execute("UPDATE outcome_schema_version SET version = 2 WHERE id = 1")
 
         conn.execute("COMMIT")
     except BaseException:
@@ -298,6 +301,7 @@ def _row_to_outcome(row: sqlite3.Row) -> Outcome:
         before_observed_at=row["before_observed_at"],
         before_source_ref=row["before_source_ref"],
         before_metric_id=row["before_metric_id"],
+        before_metric_version=row["before_metric_version"],
         after_measurement_id=row["after_measurement_id"],
         after_value=row["after_value"],
         after_source_id=row["after_source_id"],
@@ -305,6 +309,7 @@ def _row_to_outcome(row: sqlite3.Row) -> Outcome:
         after_observed_at=row["after_observed_at"],
         after_source_ref=row["after_source_ref"],
         after_metric_id=row["after_metric_id"],
+        after_metric_version=row["after_metric_version"],
         settling_seconds=row["settling_seconds"],
         started_at=row["started_at"],
         completed_at=row["completed_at"],
@@ -325,9 +330,8 @@ def _snapshot_measurement(
 ) -> Optional[MeasurementSnapshot]:
     """Read a measurement by ID and return a snapshot of provenance fields.
 
-    Does not read metric_version — that column does not exist on
-    goal_measurements.  The goal's metric_version is captured separately
-    by the caller.
+    The goal and measurement version are checked by the caller before using
+    this provenance snapshot.
     """
     row = conn.execute(
         "SELECT id, value, source_id, source_timestamp, observed_at, "
@@ -423,7 +427,7 @@ def create_outcome(
 
     # --- Goal existence + metric_version snapshot ---
     goal_row = conn.execute(
-        "SELECT id, metric_id, metric_version FROM goals WHERE id = ?",
+        "SELECT id, metric_id, source_id, metric_version FROM goals WHERE id = ?",
         (goal_id,),
     ).fetchone()
     if goal_row is None:
@@ -438,6 +442,14 @@ def create_outcome(
             raise ValueError(
                 f"before_measurement_id {before_measurement_id} does not exist"
             )
+        before_row = conn.execute(
+            "SELECT goal_id, metric_id, source_id, metric_version FROM goal_measurements WHERE id = ?",
+            (before_measurement_id,),
+        ).fetchone()
+        if (before_row["goal_id"] != goal_id or before_row["metric_id"] != goal_row["metric_id"]
+                or before_row["source_id"] != goal_row["source_id"]
+                or before_row["metric_version"] != goal_metric_version):
+            raise ValueError("before measurement provenance or metric version does not match goal")
         # Validate source_timestamp <= started_at
         if before_snap.source_timestamp > started_at:
             raise ValueError(
@@ -477,15 +489,15 @@ def create_outcome(
         "expected_direction, goal_metric_version, "
         "before_measurement_id, before_value, "
         "before_source_id, before_source_timestamp, before_observed_at, "
-        "before_source_ref, before_metric_id, "
+        "before_source_ref, before_metric_id, before_metric_version, "
         "after_measurement_id, after_value, after_source_id, "
         "after_source_timestamp, after_observed_at, after_source_ref, "
-        "after_metric_id, "
+        "after_metric_id, after_metric_version, "
         "settling_seconds, started_at, completed_at, change_summary, "
         "status, effect, confidence_delta, evaluated_at, "
         "reverted_at, revert_reason, idempotency_key, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-        "NULL, NULL, NULL, NULL, NULL, NULL, NULL, "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+        "NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, "
         "?, ?, NULL, NULL, 'pending', NULL, NULL, NULL, NULL, NULL, ?, ?)",
         (
             outcome_id, task_id, goal_id, hypothesis,
@@ -498,6 +510,7 @@ def create_outcome(
             before_snap.observed_at if before_snap else None,
             before_snap.source_ref if before_snap else None,
             before_snap.metric_id if before_snap else None,
+            goal_metric_version if before_snap else None,
             settling_seconds, started_at,
             idempotency_key, now,
         ),
@@ -590,9 +603,8 @@ def evaluate_due_outcome(
     Idempotence: already-evaluated outcomes return their existing record.
     Already-reverted outcomes return their existing record.
 
-    Note: ``goal_measurements`` does not carry metric_version.  We cannot
-    know an old measurement's version after the fact.  The fail-closed
-    metric_version check on the goal itself catches definition changes.
+    Both measurements must have the exact recorded metric version; legacy
+    NULL versions and later definition changes cannot confirm an outcome.
     """
     if not getattr(conn, "in_transaction", False):
         raise RuntimeError(
@@ -638,6 +650,17 @@ def evaluate_due_outcome(
             f"Revert or discard this outcome."
         )
 
+    if outcome.before_measurement_id is None:
+        return None  # An absent baseline cannot prove a result.
+    baseline = conn.execute(
+        "SELECT goal_id, metric_id, source_id, metric_version FROM goal_measurements WHERE id = ?",
+        (outcome.before_measurement_id,),
+    ).fetchone()
+    if (baseline is None or baseline["goal_id"] != outcome.goal_id
+            or baseline["metric_id"] != goal_metric_id or baseline["source_id"] != goal_source_id
+            or baseline["metric_version"] != outcome.goal_metric_version):
+        return None
+
     # --- Find valid after measurement ---
     # source_timestamp > completed_at, <= now, >= completed_at + settling_seconds.
     # Fresh: (now - source_timestamp) <= max_age_seconds.
@@ -651,6 +674,7 @@ def evaluate_due_outcome(
         "WHERE gm.goal_id = ? "
         "AND gm.metric_id = ? "
         "AND gm.source_id = ? "
+        "AND gm.metric_version = ? "
         "AND gm.source_timestamp > ? "
         "AND gm.source_timestamp <= ? "
         "AND gm.source_timestamp >= ? "
@@ -660,6 +684,7 @@ def evaluate_due_outcome(
             outcome.goal_id,
             goal_metric_id,
             goal_source_id,
+            outcome.goal_metric_version,
             outcome.completed_at,
             now,
             max(min_source_ts, freshness_cutoff),
@@ -702,7 +727,7 @@ def evaluate_due_outcome(
         "after_measurement_id = ?, after_value = ?, "
         "after_source_id = ?, after_source_timestamp = ?, "
         "after_observed_at = ?, after_source_ref = ?, "
-        "after_metric_id = ?, "
+        "after_metric_id = ?, after_metric_version = ?, "
         "status = ?, effect = ?, confidence_delta = ?, "
         "evaluated_at = ? "
         "WHERE id = ?",
@@ -710,7 +735,7 @@ def evaluate_due_outcome(
             after_snap.measurement_id, after_snap.value,
             after_snap.source_id, after_snap.source_timestamp,
             after_snap.observed_at, after_snap.source_ref,
-            after_snap.metric_id,
+            after_snap.metric_id, outcome.goal_metric_version,
             verdict, effect, confidence_delta,
             now,
             outcome_id,
@@ -722,6 +747,10 @@ def evaluate_due_outcome(
     # --- Emit event (safe allowlisted payload only) ---
     if verdict in ("confirmed", "falsified"):
         _try_emit_outcome_event(conn, result)
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='proposal_confidence_adjustments'").fetchone():
+            from hermes_cli.proposal_queue import _apply_locked
+            _apply_locked(conn, outcome_id)
 
     return result
 
@@ -736,40 +765,18 @@ def _try_emit_outcome_event(
     payload — the event's ``idempotency_key`` (``outcome_eval:<id>``)
     provides traceability back to the outcome row.  No patient text.
 
-    Only emits if metric_id can be normalized.  Swallows errors silently —
-    event emission must never break the evaluation path.
+    Publication and evaluation commit atomically or roll back together.
     """
-    try:
-        from hermes_cli.event_bus import publish
+    from hermes_cli.event_bus import publish
 
-        # Build safe allowlisted payload: only IDs and status.
-        payload: dict[str, Any] = {
-            "goal_id": outcome.goal_id,
-            "task_id": outcome.task_id,
-            "status": outcome.status,
-        }
-
-        # metric_id: use after_metric_id if available, else before_metric_id.
-        metric_id = outcome.after_metric_id or outcome.before_metric_id
-        if metric_id is not None and isinstance(metric_id, str) and metric_id:
-            payload["metric_id"] = metric_id
-        else:
-            # Cannot normalize metric_id — skip event entirely.
-            return
-
-        publish(
-            conn,
-            event_type="outcome.evaluated",
-            source="outcome_ledger",
-            payload=payload,
-            idempotency_key=f"outcome_eval:{outcome.id}",
-        )
-    except Exception:
-        # Best-effort: never let event emission break the evaluation path.
-        _log.debug(
-            "Failed to emit outcome.evaluated event for %s", outcome.id,
-            exc_info=True,
-        )
+    publish(
+        conn,
+        event_type="outcome.evaluated",
+        source="outcome_ledger",
+        payload={"goal_id": outcome.goal_id, "task_id": outcome.task_id,
+                 "metric_id": outcome.after_metric_id, "status": outcome.status},
+        idempotency_key=f"outcome_eval:{outcome.id}",
+    )
 
 
 def revert_outcome(
@@ -810,4 +817,32 @@ def revert_outcome(
         (now, reason, outcome_id),
     )
 
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='proposal_confidence_adjustments'").fetchone():
+        from hermes_cli.proposal_queue import _revert_locked
+        _revert_locked(conn, outcome_id)
+
     return _read_outcome(conn, outcome_id)
+
+
+def evaluate_due_batch(conn: sqlite3.Connection, *, now: float, limit: int = 50) -> int:
+    """Bounded opt-in safety-net scan; record_measurement is the primary driver."""
+    if conn.in_transaction:
+        raise RuntimeError("due scan requires an autocommit connection")
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise ValueError("limit must be 1..100")
+    _require_outcome_schema(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        rows = conn.execute(
+            "SELECT o.id FROM outcomes o JOIN goals g ON g.id = o.goal_id "
+            "WHERE o.status = 'awaiting_remeasure' AND o.goal_metric_version = g.metric_version "
+            "AND o.completed_at + o.settling_seconds <= ? "
+            "ORDER BY o.completed_at, o.id LIMIT ?", (now, limit),
+        ).fetchall()
+        count = sum(evaluate_due_outcome(conn, row[0], now=now) is not None for row in rows)
+        conn.execute("COMMIT")
+        return count
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise

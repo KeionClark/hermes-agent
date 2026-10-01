@@ -151,9 +151,12 @@ def propose_for_gap(
                 or row["source_timestamp"] > now
                 or now - row["source_timestamp"] > row["max_age_seconds"]):
             raise ValueError("no current provenance-backed active gap")
-        # V1 measurements have no version snapshot. A changed goal cannot
-        # prove that a prior measurement used its current metric definition.
-        if row["metric_version"] != 1:
+        # The measurement must carry the exact version at observation time.
+        version = conn.execute("SELECT metric_version FROM goal_measurements WHERE id = ?",
+                               (gap_measurement_id,)).fetchone()[0]
+        if version is not None and version != row["metric_version"]:
+            raise ValueError("gap measurement metric version cannot be proven")
+        if version is None and row["metric_version"] != 1:
             raise ValueError("gap measurement metric version cannot be proven")
         duplicate = conn.execute("SELECT * FROM gap_proposals WHERE identity_hash = ? "
                                  "AND status = 'active'", (identity_hash,)).fetchone()
@@ -256,16 +259,17 @@ def _apply_locked(conn: sqlite3.Connection, outcome_id: str) -> float | None:
         return None
     goal = conn.execute("SELECT metric_version, metric_id, source_id, max_age_seconds FROM goals WHERE id = ?",
                         (outcome["goal_id"],)).fetchone()
-    # V1 goal_measurements contains no version snapshot. Only a never-changed
-    # metric definition (version 1) can be proved from this schema.
-    if (goal is None or goal["metric_version"] != 1
-            or outcome["goal_metric_version"] != goal["metric_version"]):
+    if (goal is None or outcome["goal_metric_version"] != goal["metric_version"]):
         return None
     readings = conn.execute("SELECT * FROM goal_measurements WHERE id IN (?, ?)",
                             (before, after)).fetchall()
     if len(readings) != 2:
         return None
     by_id = {r["id"]: r for r in readings}
+    if any(r["metric_version"] != goal["metric_version"]
+           and not (r["metric_version"] is None and goal["metric_version"] == 1)
+           for r in readings):
+        return None
     for name, reading in (("before", by_id[before]), ("after", by_id[after])):
         if (reading["goal_id"] != outcome["goal_id"]
                 or reading["metric_id"] != goal["metric_id"]
@@ -314,18 +318,22 @@ def revert_evaluated_outcome(conn: sqlite3.Connection, outcome_id: str) -> float
         raise RuntimeError("confidence adjustment requires an autocommit connection")
     conn.execute("BEGIN IMMEDIATE")
     try:
-        outcome = conn.execute("SELECT status FROM outcomes WHERE id = ?", (outcome_id,)).fetchone()
-        adjustment = conn.execute("SELECT action_type, applied FROM proposal_confidence_adjustments "
-                                  "WHERE outcome_id = ?", (outcome_id,)).fetchone()
-        result = None
-        if outcome is not None and outcome["status"] == "reverted" and adjustment is not None:
-            if adjustment["applied"]:
-                conn.execute("UPDATE proposal_confidence_adjustments SET applied = 0 "
-                             "WHERE outcome_id = ?", (outcome_id,))
-                _rescore(conn, adjustment["action_type"])
-            result = _action_prior(conn, adjustment["action_type"])
+        result = _revert_locked(conn, outcome_id)
         conn.execute("COMMIT")
         return result
     except BaseException:
         conn.execute("ROLLBACK")
         raise
+
+
+def _revert_locked(conn: sqlite3.Connection, outcome_id: str) -> float | None:
+    outcome = conn.execute("SELECT status FROM outcomes WHERE id = ?", (outcome_id,)).fetchone()
+    adjustment = conn.execute("SELECT action_type, applied FROM proposal_confidence_adjustments "
+                              "WHERE outcome_id = ?", (outcome_id,)).fetchone()
+    if outcome is None or outcome["status"] != "reverted" or adjustment is None:
+        return None
+    if adjustment["applied"]:
+        conn.execute("UPDATE proposal_confidence_adjustments SET applied = 0 "
+                     "WHERE outcome_id = ?", (outcome_id,))
+        _rescore(conn, adjustment["action_type"])
+    return _action_prior(conn, adjustment["action_type"])

@@ -535,3 +535,52 @@ def run_once(
         acts_deduplicated=acts_deduplicated,
         noop_reasons=noop_reasons,
     )
+
+
+def propose_gap_once(
+    conn: sqlite3.Connection, *, subscriber_id: str, candidates: list[dict[str, Any]],
+    max_events: int = 20, now: Optional[float] = None,
+) -> int:
+    """Explicit opt-in gap-event producer. Proposals are inert, never Act cards.
+
+    Candidates are supplied by the caller, not synthesized from a metric or
+    routed to a worker. A retry sees the same event identity and deduplicates.
+    No scheduler or canonical-board subscription is installed here.
+    """
+    from hermes_cli.proposal_queue import propose_for_gap
+
+    if conn.in_transaction:
+        raise RuntimeError("proposal producer needs an autocommit connection")
+    if not 1 <= max_events <= 100:
+        raise ValueError("max_events must be 1..100")
+    now = time.time() if now is None else now
+    event_bus.subscribe(conn, subscriber_id, event_types={"goal.gap_detected"}, start="beginning")
+    produced = 0
+    for evt in event_bus.poll(conn, subscriber_id, limit=max_events):
+        goal_id = evt.payload.get("goal_id")
+        metric_id = evt.payload.get("metric_id")
+        if not isinstance(goal_id, str) or not isinstance(metric_id, str):
+            with write_txn(conn):
+                event_bus.ack(conn, subscriber_id, evt.id)
+            continue
+        # A later healthy observation invalidates an old gap event.
+        row = conn.execute(
+            "SELECT id, source_timestamp, edge_state FROM goal_measurements "
+            "WHERE goal_id = ? ORDER BY id DESC LIMIT 1", (goal_id,),
+        ).fetchone()
+        if row and row["edge_state"] == "breached" and row["source_timestamp"] == evt.payload.get("source_timestamp"):
+            for candidate in candidates:
+                if candidate["goal_id"] != goal_id or candidate["metric_id"] != metric_id:
+                    continue
+                propose_for_gap(
+                    conn, goal_id=goal_id, metric_id=metric_id, gap_measurement_id=row["id"],
+                    action_type=candidate["action_type"], hypothesis=candidate["hypothesis"],
+                    proposed_action=candidate["proposed_action"], impact=candidate["impact"],
+                    confidence=candidate["confidence"], cost=candidate["cost"],
+                    decision_tier=candidate["decision_tier"],
+                    idempotency_key=f"gap_proposal:{evt.id}:{candidate['idempotency_key']}", now=now,
+                )
+                produced += 1
+        with write_txn(conn):
+            event_bus.ack(conn, subscriber_id, evt.id)
+    return produced

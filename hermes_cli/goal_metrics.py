@@ -45,7 +45,7 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_GOAL_SCHEMA_VERSION = 1
+_GOAL_SCHEMA_VERSION = 2
 _MAX_CLOCK_SKEW_SECONDS = 300  # 5 minutes future tolerance
 _MAX_TITLE_LEN = 512  # bounded free text for internal use only
 
@@ -232,8 +232,14 @@ def migrate_goal_schema(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "INSERT OR REPLACE INTO goal_schema_version "
                 "(id, version) VALUES (1, ?)",
-                (_GOAL_SCHEMA_VERSION,),
+                (1,),
             )
+
+        if current < 2:
+            # Historical measurements have unknown definitions; never backfill
+            # them from the goal's current version.
+            conn.execute("ALTER TABLE goal_measurements ADD COLUMN metric_version INTEGER")
+            conn.execute("UPDATE goal_schema_version SET version = 2 WHERE id = 1")
 
         conn.execute("COMMIT")
     except BaseException:
@@ -681,11 +687,11 @@ def record_measurement(
         "INSERT INTO goal_measurements "
         "(goal_id, metric_id, value, source_id, source_timestamp, "
         "observed_at, source_ref, payload_hash, idempotency_key, "
-        "edge_state, gap_value, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "edge_state, gap_value, created_at, metric_version) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (goal_id, metric_id, value, source_id, source_timestamp,
          observed_at, source_ref, payload_hash, idempotency_key,
-         edge_state, gap_value, m_now),
+         edge_state, gap_value, m_now, goal.metric_version),
     )
     assert cur.lastrowid is not None, "INSERT must return a rowid"
     measurement_id: int = cur.lastrowid
@@ -706,6 +712,20 @@ def record_measurement(
             prev_edge=prev_edge_state,
             source_timestamp=source_timestamp,
         )
+
+    # Evaluate inside the caller's transaction: rolled-back measurements can
+    # never produce committed verdicts or events, and same-edge readings count.
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='outcomes'").fetchone():
+        from hermes_cli.outcome_ledger import evaluate_due_outcome
+        due = conn.execute(
+            "SELECT id FROM outcomes WHERE goal_id = ? AND status = 'awaiting_remeasure' "
+            "AND goal_metric_version = ? AND before_metric_version = ? "
+            "AND completed_at < ? AND completed_at + settling_seconds <= ? "
+            "ORDER BY completed_at DESC, id LIMIT 50",
+            (goal_id, goal.metric_version, goal.metric_version, source_timestamp, source_timestamp),
+        ).fetchall()
+        for row in due:
+            evaluate_due_outcome(conn, row[0], now=observed_at)
 
     measurement = Measurement(
         id=measurement_id,
