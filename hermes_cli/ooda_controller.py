@@ -19,13 +19,16 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sqlite3
 import time
+import uuid
 from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
-from hermes_cli import event_bus
+from hermes_cli import event_bus, ooda_guardrails
 from hermes_cli.kanban_db_connect import write_txn
 
 _log = logging.getLogger(__name__)
@@ -57,6 +60,86 @@ class OodaResult:
     acts_created: int
     acts_deduplicated: int
     noop_reasons: list[str] = field(default_factory=list)
+    rollback_proposals: list[ooda_guardrails.RollbackProposal] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class GuardrailPolicy:
+    """Explicit, externally verified budget and provenance for dark Act admission.
+
+    Values here are supplied by a trusted operator; this class does not grant
+    spending approval. The controller never guesses model price or actual usage.
+    """
+    agent_id: str
+    lane_id: str
+    estimated_tokens: int
+    price_per_million_usd: Decimal | str
+    caps: Mapping[str, Decimal | str]
+    approval_ref: str
+    drift_max_ratio: float
+    drift_min_samples: int = 10
+    # Optional independent secondary signal: (primary outcome, secondary goal,
+    # baseline measurement, min ratio, max ratio). Latest is looked up here.
+    trip_wire: Optional[tuple[str, str, int, float, float]] = None
+
+
+def _halt(conn: sqlite3.Connection, scope: str, reason: str, now: float) -> None:
+    """Persist a deduplicated halt, without ACKing the triggering event."""
+    with write_txn(conn):
+        ooda_guardrails._record_halt(conn, scope, reason, now)
+
+
+def _check_safety(conn: sqlite3.Connection, policy: GuardrailPolicy, goal_id: str,
+                  now: float) -> tuple[Optional[str], Optional[ooda_guardrails.RollbackProposal]]:
+    drift = ooda_guardrails.evaluate_drift(
+        conn, policy.agent_id, now, min_samples=policy.drift_min_samples,
+    )
+    if drift.sufficient_evidence and drift.drift_rate is not None and drift.drift_rate > policy.drift_max_ratio:
+        outcomes = conn.execute(
+            "SELECT o.id FROM outcomes o WHERE o.status IN ('confirmed', 'falsified') "
+            "AND o.evaluated_at BETWEEN ? AND ? AND o.task_id IN "
+            "(SELECT task_id FROM guardrail_reservations WHERE agent_id = ?) "
+            "ORDER BY o.evaluated_at DESC LIMIT 20",
+            (drift.window_start, now, policy.agent_id),
+        ).fetchall()
+        proposal = ooda_guardrails.propose_rollback(
+            conn, 'evaluated_outcome_drift', [r[0] for r in outcomes],
+        )
+        return "drift:threshold_exceeded", proposal
+    if policy.trip_wire is not None:
+        outcome_id, secondary_goal_id, baseline_id, minimum, maximum = policy.trip_wire
+        outcome = conn.execute(
+            "SELECT goal_id FROM outcomes WHERE id = ?", (outcome_id,),
+        ).fetchone()
+        if outcome is None or outcome[0] != goal_id:
+            return "trip_wire:primary_outcome_goal_mismatch", None
+        latest = conn.execute(
+            "SELECT id FROM goal_measurements WHERE goal_id = ? ORDER BY id DESC LIMIT 1",
+            (secondary_goal_id,),
+        ).fetchone()
+        if latest is None:
+            return "trip_wire:secondary_measurement_missing", None
+        provenance = conn.execute(
+            "SELECT g.source_id, b.source_id, l.source_id, b.metric_version, l.metric_version "
+            "FROM goals g JOIN goal_measurements b ON b.id = ? "
+            "JOIN goal_measurements l ON l.id = ? WHERE g.id = ?",
+            (baseline_id, latest[0], goal_id),
+        ).fetchone()
+        if (provenance is None or not provenance[1] or not provenance[2]
+                or provenance[0] in (provenance[1], provenance[2])
+                or provenance[1] != provenance[2]
+                or provenance[3] is None or provenance[3] != provenance[4]):
+            return "trip_wire:unverified_independent_measurements", None
+        trip = ooda_guardrails.evaluate_trip_wire(
+            conn, goal_id, outcome_id, secondary_goal_id, baseline_id,
+            latest[0], minimum, maximum, now,
+        )
+        if trip.tripped is None:
+            return f"trip_wire:unknown:{trip.reason}", None
+        if trip.tripped:
+            proposal = ooda_guardrails.propose_rollback(conn, 'independent_trip_wire', [outcome_id])
+            return "trip_wire:tripped", proposal
+    return None, None
 
 
 # -----------------------------------------------------------------------
@@ -277,7 +360,6 @@ def _act_create_investigation(
 
     Never spawns a worker directly.
     """
-    import uuid
     from hermes_cli.kanban_event_publish import emit_card_created
 
     goal_id = context["goal_id"]
@@ -295,7 +377,7 @@ def _act_create_investigation(
     if existing is not None:
         return None  # Already exists — dedup, return None to signal.
 
-    task_id = f"t_{uuid.uuid4().hex[:8]}"
+    task_id = context.get("reserved_task_id") or f"t_{uuid.uuid4().hex[:8]}"
     title = f"Investigate {metric_id} gap (goal {goal_id[:8]})"
     body = (
         f"Auto-created by OODA controller.\n\n"
@@ -359,6 +441,8 @@ def run_once(
     assignee: str = "default",
     tenant: Optional[str] = None,
     now: Optional[float] = None,
+    guardrail_policy: Optional[GuardrailPolicy] = None,
+    guardrails_enabled: bool = True,
 ) -> OodaResult:
     """Finite, opt-in OODA loop: Observe-Orient-Decide-Act.
 
@@ -424,6 +508,29 @@ def run_once(
     if not isinstance(assignee, str) or not profile_exists(assignee):
         raise ValueError("assignee must be an existing live profile")
 
+    policy = guardrail_policy
+    if guardrails_enabled:
+        if not isinstance(guardrail_policy, GuardrailPolicy):
+            raise ValueError("explicit guardrail policy and approved caps required before Act")
+        policy = guardrail_policy
+        if (not all(isinstance(v, str) and v.strip() for v in
+                    (policy.agent_id, policy.lane_id, policy.approval_ref))
+                or type(policy.estimated_tokens) is not int or policy.estimated_tokens <= 0
+                or not isinstance(policy.caps, Mapping)
+                or set(policy.caps) != {"task_token", "agent_day", "lane_week", "global_day"}
+                or not isinstance(policy.drift_max_ratio, (int, float))
+                or not math.isfinite(policy.drift_max_ratio)
+                or not 0 <= policy.drift_max_ratio <= 1
+                or type(policy.drift_min_samples) is not int or policy.drift_min_samples < 1):
+            raise ValueError("guardrail policy requires verified price, approval, four caps and drift threshold")
+        # No implicit schema migration, including on an empty event bus.
+        ooda_guardrails._require_guardrail_schema(conn)
+        # Reserve validates price and cap types even when there is no event;
+        # no speculative reservation is created here.
+        ooda_guardrails._to_micro_usd(policy.price_per_million_usd)
+    elif guardrail_policy is not None:
+        raise ValueError("guardrail policy cannot be bypassed by disabling guardrails")
+
     if now is None:
         now = time.time()
 
@@ -439,6 +546,7 @@ def run_once(
     acts_created = 0
     acts_deduplicated = 0
     noop_reasons: list[str] = []
+    rollback_proposals: list[ooda_guardrails.RollbackProposal] = []
 
     # --- Observe ---
     events = _observe(
@@ -482,7 +590,10 @@ def run_once(
             # Capacity, rights, card insertion and ACK share one IMMEDIATE write
             # transaction. A second controller cannot race the capacity read.
             deferred_for_capacity = False
-            with write_txn(conn):
+            denied_reason = None
+            created_this_event = False
+            try:
+              with write_txn(conn):
                 idem_key = _stable_idempotency_key(
                     action_context["goal_id"],
                     action_context["metric_id"],
@@ -501,21 +612,57 @@ def run_once(
                         active_count=active_count,
                     )
                     if should_act:
-                        task_id = _act_create_investigation(
-                            conn, action_context,
-                            assignee=assignee,
-                            permitted_board=permitted_board,
-                            tenant=tenant,
-                        )
-                        if task_id is None:
-                            raise RuntimeError("investigation card not persisted; keep event pending")
-                        acts_created += 1
+                        if guardrails_enabled:
+                            assert policy is not None
+                            denied_reason, proposal = _check_safety(
+                                conn, policy, action_context["goal_id"], now,
+                            )
+                            if proposal is not None:
+                                rollback_proposals.append(proposal)
+                            if denied_reason is None:
+                                reserved_task_id = f"t_{uuid.uuid4().hex[:8]}"
+                                reservation = ooda_guardrails.reserve_act(
+                                    conn, task_id=reserved_task_id, agent_id=policy.agent_id,
+                                    lane_id=policy.lane_id, reservation_key=idem_key,
+                                    estimated_tokens=policy.estimated_tokens,
+                                    price_per_million_usd=policy.price_per_million_usd,
+                                    caps=policy.caps, now=now, approval_ref=policy.approval_ref,
+                                )
+                                if not reservation.allowed:
+                                    denied_reason = reservation.reason
+                                else:
+                                    action_context["reserved_task_id"] = reserved_task_id
+                        if denied_reason is not None:
+                            deferred_for_capacity = True
+                        else:
+                            task_id = _act_create_investigation(
+                                conn, action_context,
+                                assignee=assignee,
+                                permitted_board=permitted_board,
+                                tenant=tenant,
+                            )
+                            if task_id is None:
+                                raise RuntimeError("investigation card not persisted; keep event pending")
+                            created_this_event = True
                     else:
                         events_skipped += 1
                         noop_reasons.append(f"decide_no:{reason}:{evt.id}")
                         deferred_for_capacity = reason == "at_capacity"
                 if not deferred_for_capacity:
                     event_bus.ack(conn, subscriber_id, evt.id)
+            except Exception as exc:
+                if not guardrails_enabled:
+                    raise
+                denied_reason = f"act_failure:{type(exc).__name__}"
+            if denied_reason is not None:
+                # Any reservation and card from a failed transaction rolled back.
+                # Cap-denial halt inside reserve remains if the transaction committed.
+                assert policy is not None
+                _halt(conn, f"agent:{policy.agent_id}", denied_reason, now)
+                noop_reasons.append(f"guardrail_halt:{denied_reason}:{evt.id}")
+                break
+            if created_this_event:
+                acts_created += 1
             if deferred_for_capacity:
                 # Keep the first unserved edge pending, in order, until a
                 # terminal run frees a slot. ACK would lose it forever.
@@ -534,6 +681,7 @@ def run_once(
         acts_created=acts_created,
         acts_deduplicated=acts_deduplicated,
         noop_reasons=noop_reasons,
+        rollback_proposals=rollback_proposals,
     )
 
 

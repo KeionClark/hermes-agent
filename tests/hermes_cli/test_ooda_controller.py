@@ -44,8 +44,13 @@ from hermes_cli.ooda_controller import (
     _orient_gap,
     _orient_run_completed,
     _stable_idempotency_key,
-    run_once,
+    run_once as _guarded_run_once,
 )
+
+
+def run_once(*args, **kwargs):
+    """P1 legacy dark-mode fixture; guarded Act has separate integration tests."""
+    return _guarded_run_once(*args, guardrails_enabled=False, **kwargs)
 
 
 # ---------------------------------------------------------------------------
