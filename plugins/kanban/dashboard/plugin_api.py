@@ -812,11 +812,6 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, 'status', ?, ?)",
             (task_id, run_id, json.dumps({"status": effective_status, "requested_status": new_status}), int(time.time())))
-        # P0a event bus: dashboard direct status mutation
-        from hermes_cli import kanban_event_publish
-        kanban_event_publish.emit_status_changed(conn, task_id, from_status=prev["status"], to_status=effective_status, run_id=run_id)
-        if effective_status == "done":
-            kanban_event_publish.emit_card_completed(conn, task_id, run_id=run_id)
         if reopening_satisfied_parent:
             # Domain-layer invalidation composes via a savepoint inside our txn and hands
             # back worker terminations to perform post-commit.

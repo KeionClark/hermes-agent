@@ -149,9 +149,6 @@ def decompose_triage_task(
             params.append(root_assignee)
         params.append(task_id)
         conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", tuple(params))
-        # P0a event bus: triage -> todo for the root
-        from hermes_cli import kanban_event_publish
-        kanban_event_publish.emit_status_changed(conn, task_id, from_status="triage", to_status="todo")
         if author and author.strip():
             _insert_comment(
                 conn, task_id, author.strip(),
@@ -214,8 +211,4 @@ def _insert_decomposed_child(
         conn, new_id, "created", {"by": author or "decomposer", "from_decompose_of": root_id},
     )
     inherit_creator_origin(conn, new_id, root_id, created_at=now)
-    # P0a event bus: decomposer child card
-    from hermes_cli import kanban_event_publish
-    kanban_event_publish.emit_card_created(conn, new_id)
-    kanban_event_publish.emit_status_changed(conn, new_id, from_status=None, to_status="todo")
     return new_id

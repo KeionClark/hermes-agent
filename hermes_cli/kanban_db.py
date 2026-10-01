@@ -30,12 +30,6 @@ from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
 
-# Lazy import to avoid circular dependencies; only used inside write_txn guards.
-def _ep():
-    """Late-bound access to kanban_event_publish helpers."""
-    from hermes_cli import kanban_event_publish
-    return kanban_event_publish
-
 
 # --- Shared micro-helpers (row access, JSON, env, git) ---
 
@@ -1430,11 +1424,6 @@ def create_task(
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
-                # --- P0a event bus: card.created + initial status ---
-                _ep().emit_card_created(conn, task_id)
-                _ep().emit_status_changed(conn, task_id, from_status=None, to_status=task_status)
-                if task_status == "blocked":
-                    _ep().emit_card_blocked(conn, task_id, block_kind=None)
             return task_id
         except sqlite3.IntegrityError:
             # Under an outer transaction the unique constraint still arbitrates
@@ -1695,7 +1684,6 @@ def link_tasks(
             )
             gated = cur.rowcount == 1
             if gated:
-                _ep().emit_status_changed(conn, child_id, from_status="ready", to_status="todo")
                 _append_event(
                     conn,
                     child_id,
@@ -2239,7 +2227,6 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
                         "UPDATE tasks SET status = ? WHERE id = ? AND status = 'todo'",
                         (resume_status, task_id),
                     )
-                _ep().emit_status_changed(conn, task_id, from_status=cur_status, to_status=resume_status)
                 _append_event(
                     conn, task_id, "promoted",
                     {"status": resume_status} if resume_status != "ready" else None,
@@ -2318,7 +2305,6 @@ def _claim_and_open_run(
         conn, task_id, "claimed",
         {"lock": lock, "expires": expires, "run_id": run_id, **(event_extra or {})}, run_id=run_id,
     )
-    _ep().emit_status_changed(conn, task_id, from_status=source_status, to_status="running", run_id=run_id)
     return run_id
 
 
@@ -2343,7 +2329,6 @@ def claim_task(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready'", (task_id,),
             )
-            _ep().emit_status_changed(conn, task_id, from_status="ready", to_status="todo")
             _append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
             return None
         # Close a leaked prior run so the CAS below doesn't strand it.
@@ -2375,7 +2360,6 @@ def claim_review_task(
                 "WHERE id = ? AND status = 'review' AND claim_lock IS NULL", (task_id,),
             )
             if demoted.rowcount == 1:
-                _ep().emit_status_changed(conn, task_id, from_status="review", to_status="todo")
                 _append_event(
                     conn, task_id, "dependency_wait",
                     {"reason": "parent_reopened", "source_status": "review"},
@@ -2560,7 +2544,6 @@ def release_stale_claims(
                     "retry_status": retry_status,
                 },
             )
-            _ep().emit_status_changed(conn, row["id"], from_status="running", to_status=retry_status, run_id=run_id)
             reclaimed += 1
         # Own txn, after the reclaim commit (same shape as ``enforce_max_runtime``):
         # the run ended without a verdict, so it counts toward the breaker and a
@@ -2655,7 +2638,6 @@ def reclaim_task(
             error=f"manual_reclaim: {reason}" if reason else f"manual_reclaim lock={prev_lock}",
             payload={"manual": True, "reason": reason, "prev_lock": prev_lock, "retry_status": retry_status},
         )
-        _ep().emit_status_changed(conn, task_id, from_status="running", to_status=retry_status)
     # Operator intervention = fresh retry budget (own txn, runs after commit).
     _clear_failure_counter(conn, task_id)
     return True
@@ -2888,8 +2870,6 @@ def complete_task(
             _completed_event_payload(result, event_summary, verified_cards, metadata),
             run_id=run_id,
         )
-        _ep().emit_status_changed(conn, task_id, from_status=prior_status, to_status="done", run_id=run_id)
-        _ep().emit_card_completed(conn, task_id, run_id=run_id)
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
     # Success wipes the breaker counter (history stays on the event log).
     _clear_failure_counter(conn, task_id)
@@ -3326,8 +3306,6 @@ def block_task(
             _append_event(conn, task_id, "blocked", {
                 "kind": kind, "reason": reason, "classified_in_place": True,
             })
-            # In-place reclassification: NO card.blocked or status_changed
-            # (status did not actually change).
             return True
         source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
         requested_kind = kind
@@ -3367,12 +3345,6 @@ def block_task(
             conn, task_id, outcome="blocked", status="blocked", summary=reason, synthesize=bool(reason),
         )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
-        # P0a event bus: emit status transition + card.blocked only for
-        # actual entry to "blocked" (not dependency todo or loop triage).
-        prior = cur_row["status"]
-        _ep().emit_status_changed(conn, task_id, from_status=prior, to_status=new_status, run_id=run_id)
-        if new_status == "blocked":
-            _ep().emit_card_blocked(conn, task_id, run_id=run_id, block_kind=kind)
         blocked_task = get_task(conn, task_id)
         if kind == "dependency":
             # Historical ordering: the dependency lane fires inside the txn.
@@ -3548,7 +3520,6 @@ def request_review(
             if staged:
                 payload["artifacts"] = staged
             _append_event(conn, task_id, "review_requested", payload, run_id=run_id)
-            _ep().emit_status_changed(conn, task_id, from_status=trow["status"], to_status="review", run_id=run_id)
     except Exception:
         if staged_copies:
             _discard_staged_copies(staged_copies, staged_copies[0].parent)
@@ -3631,7 +3602,6 @@ def request_changes(
         run_id = _end_run(
             conn, task_id, outcome="changes_requested", status=new_status, summary=reason,
         )
-        _ep().emit_status_changed(conn, task_id, from_status="running", to_status=new_status, run_id=run_id)
         _append_event(
             conn,
             task_id,
@@ -3691,7 +3661,6 @@ def promote_task(
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
-        _ep().emit_status_changed(conn, task_id, from_status=cur_status, to_status="ready")
         _append_event(conn, task_id, "promoted_manual", {"actor": actor, "reason": reason})
 
     return True, None
@@ -3732,10 +3701,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     when that is where it left off), closing any leaked run first."""
     now = int(time.time())
     with write_txn(conn):
-        prior_status = _task_status(conn, task_id)
         resume_status = (
             _resume_status_from_events(conn, task_id)
-            if prior_status == "blocked"
+            if _task_status(conn, task_id) == "blocked"
             else "ready"
         )
         _reclaim_dangling_run(
@@ -3761,7 +3729,6 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
-        _ep().emit_status_changed(conn, task_id, from_status=prior_status, to_status=new_status)
         _append_event(
             conn, task_id, "unblocked",
             (
@@ -3863,7 +3830,6 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         payload: dict[str, Any] = {"status": new_status}
         if implementer:
             payload["implementer"] = implementer
-        _ep().emit_status_changed(conn, task_id, from_status="review", to_status=new_status)
         _append_event(
             conn, task_id, "review_reopened", payload if payload != {"status": "ready"} else None,
         )
@@ -3932,7 +3898,6 @@ def invalidate_descendants_for_parent_reopen(
                 "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                 "current_run_id = NULL, consecutive_failures = 0 WHERE id = ?", (row["id"],),
             )
-            _ep().emit_status_changed(conn, row["id"], from_status=previous_status, to_status="todo", run_id=run_id)
             entry = {
                 "id": row["id"], "prior_status": previous_status,
                 "new_status": "todo", "resume_status": resume_status,
@@ -4006,7 +3971,6 @@ def specify_triage_task(
         )
         if cur.rowcount != 1:
             return False
-        _ep().emit_status_changed(conn, task_id, from_status="triage", to_status="todo")
         if changed_fields and author and author.strip():
             # Not add_comment (own txn + 'commented' event); 'specified' below records it.
             _insert_comment(
@@ -4059,7 +4023,6 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
             conn, task_id, outcome="reclaimed", status="reclaimed",
             summary="task archived with run still active",
         )
-        _ep().emit_status_changed(conn, task_id, from_status=row["status"], to_status="archived", run_id=run_id)
         _append_event(conn, task_id, "archived", None, run_id=run_id)
     if was_running:
         termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
@@ -4108,7 +4071,6 @@ def schedule_task(
     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
     until ``unblock_task`` re-gates it."""
     with write_txn(conn):
-        prior_status = _task_status(conn, task_id)
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
@@ -4127,7 +4089,6 @@ def schedule_task(
         run_id = _end_or_synthesize_run(
             conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
         )
-        _ep().emit_status_changed(conn, task_id, from_status=prior_status, to_status="scheduled", run_id=run_id)
         _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
         return True
 

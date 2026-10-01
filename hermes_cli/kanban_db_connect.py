@@ -729,7 +729,6 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
             if resolved not in _INITIALIZED_PATHS:
                 conn.executescript(_kb.SCHEMA_SQL)
                 _migrate_add_optional_columns(conn)
-                _migrate_event_bus_schema(conn)
                 _INITIALIZED_PATHS.add(resolved)
 
         conn, _ = _open_configured(path, _init_if_needed)
@@ -859,16 +858,6 @@ _TASK_RUN_COLUMNS = (
     # terminal-worker reaper; NULL = legacy row, never signalled).
     ("worker_started_at", "worker_started_at INTEGER"),
 )
-
-
-def _migrate_event_bus_schema(conn: sqlite3.Connection) -> None:
-    """Run the event-bus schema migration after the core schema/column pass.
-
-    Uses ``conn.execute`` (not ``executescript``) so it participates in the
-    caller's active transaction.  Idempotent; safe on fresh and legacy boards.
-    """
-    from hermes_cli.event_bus import migrate_event_bus
-    migrate_event_bus(conn)
 
 
 def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:

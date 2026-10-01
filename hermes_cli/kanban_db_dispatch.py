@@ -731,7 +731,6 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                     error=error, metadata=payload,
                 )
                 _kb._append_event(conn, tid, "timed_out", payload, run_id=run_id)
-                _ep.emit_status_changed(conn, tid, from_status="running", to_status=retry_status, run_id=run_id)
                 timed_out.append(tid)
         # Outside the write_txn above because ``_record_task_failure`` opens its
         # own. If the breaker trips this flips the task to ``blocked`` and emits
@@ -845,7 +844,6 @@ def detect_stale_running(
                 metadata=payload,
             )
             _kb._append_event(conn, tid, "stale", payload, run_id=run_id)
-            _ep.emit_status_changed(conn, tid, from_status="running", to_status=retry_status, run_id=run_id)
             reclaimed.append(tid)
 
     return reclaimed
@@ -909,7 +907,6 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
                 now,
             )
             _kb._append_event(conn, tid, "reconciled", payload, run_id=run_id)
-            _ep.emit_status_changed(conn, tid, from_status="running", to_status="ready", run_id=run_id)
             reconciled.append(tid)
         _kb._log.info(
             "kanban reconcile: requeued orphaned running task %s "
@@ -1186,7 +1183,6 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 metadata=dict(dead.event_payload),
             )
             _kb._append_event(conn, row["id"], dead.event_kind, dead.event_payload, run_id=run_id)
-            _ep.emit_status_changed(conn, row["id"], from_status="running", to_status=retry_status, run_id=run_id)
             sweep.exited_hook_payloads.append({
                 "task_id": row["id"],
                 "assignee": row["assignee"],
@@ -1409,7 +1405,6 @@ def _record_task_failure(
                     "WHERE id = ? AND status = 'running'",
                     (retry_status, failures, error, task_id),
                 )
-                _ep.emit_status_changed(conn, task_id, from_status="running", to_status=retry_status)
             else:
                 conn.execute(
                     "UPDATE tasks SET consecutive_failures = ?, "
@@ -1429,7 +1424,6 @@ def _record_task_failure(
 
         # Spawn path (release_claim) is still running and also clears claim
         # state; the timeout/crash path already did.
-        prior_status = row["status"]
         conn.execute(
             "UPDATE tasks SET status = 'blocked', "
             + ("claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
@@ -1438,8 +1432,6 @@ def _record_task_failure(
             "WHERE id = ? AND status IN ('running', 'ready', 'review')",
             (failures, error, task_id),
         )
-        _ep.emit_status_changed(conn, task_id, from_status=prior_status, to_status="blocked")
-        _ep.emit_card_blocked(conn, task_id, block_kind=None)
         payload = {
             "failures": failures,
             "effective_limit": effective_limit,
@@ -3085,4 +3077,3 @@ def run_daemon(
 from hermes_cli import kanban_db as _kb  # noqa: E402
 from hermes_cli import kanban_db_connect as _kbc  # noqa: E402
 from hermes_cli import kanban_db_workspace as _kbw  # noqa: E402
-from hermes_cli import kanban_event_publish as _ep  # noqa: E402

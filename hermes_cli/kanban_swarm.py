@@ -100,10 +100,6 @@ def _activate_root_inline(
     kb._append_event(
         conn, root_id, "completed", {"result_len": 0, "summary": summary[:400] or None}, run_id=run_id,
     )
-    # P0a event bus: swarm root activation
-    from hermes_cli import kanban_event_publish
-    kanban_event_publish.emit_status_changed(conn, root_id, from_status="blocked", to_status="done", run_id=run_id)
-    kanban_event_publish.emit_card_completed(conn, root_id, run_id=run_id)
     return True
 
 
