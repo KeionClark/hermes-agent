@@ -400,7 +400,7 @@ class TestPrivacy:
             assert "patient needs consult" not in payload_str
             # Only allowed keys
             for key in payload:
-                assert key in {"task_id", "from", "to", "run_id", "block_kind"}, \
+                assert key in {"task_id", "from", "to", "run_id", "block_kind", "outcome"}, \
                     f"unexpected key {key!r} in event payload"
 
 

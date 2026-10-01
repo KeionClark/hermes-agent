@@ -2021,7 +2021,7 @@ def _end_run(
     run_id = _current_run_id(conn, task_id)
     if run_id is None:
         return None
-    conn.execute(
+    updated = conn.execute(
         """
         UPDATE task_runs
            SET status        = ?,
@@ -2036,7 +2036,11 @@ def _end_run(
         """,
         (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
     )
-    conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
+    if updated.rowcount != 1:
+        return None
+    conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ? AND current_run_id = ?", (task_id, run_id))
+    from hermes_cli.kanban_event_publish import emit_run_completed
+    emit_run_completed(conn, task_id, run_id=run_id, outcome=outcome)
     return run_id
 
 
@@ -2122,7 +2126,10 @@ def _synthesize_ended_run(
             now, now,
         ),
     )
-    return int(cur.lastrowid or 0)
+    run_id = int(cur.lastrowid or 0)
+    from hermes_cli.kanban_event_publish import emit_run_completed
+    emit_run_completed(conn, task_id, run_id=run_id, outcome=outcome)
+    return run_id
 
 
 # --- Dependency resolution (todo -> ready) ---

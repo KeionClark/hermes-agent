@@ -162,7 +162,15 @@ def _orient_run_completed(
     outcome = payload.get("outcome")
     run_id = payload.get("run_id")
 
-    if not task_id:
+    if not isinstance(task_id, str) or not isinstance(run_id, int):
+        return None
+    row = conn.execute(
+        "SELECT 1 FROM tasks t JOIN task_runs r ON r.task_id = t.id "
+        "WHERE t.id = ? AND r.id = ? AND r.ended_at IS NOT NULL "
+        "AND t.idempotency_key LIKE 'ooda:investigate:%'",
+        (task_id, run_id),
+    ).fetchone()
+    if row is None:
         return None
 
     return {
@@ -208,9 +216,9 @@ def _decide(
         ctx = ActionContext(
             evidence_ref=str(evidence_ref),
             effect_scope="investigation",
-            audience=None,
+            audience="ooda-controller",
             reserved_effects=frozenset(),
-            same_purpose=None,
+            same_purpose=True,
             bounded_pilot=True,
             send_cap=None,
             qa_revision=None,
@@ -218,15 +226,15 @@ def _decide(
             release_gate_ref=None,
             explicit_approval_ref=None,
             external_access_ready=None,
+            bounded_safe_scope=True,
+            dependency_ready=True,
         )
-        decision = classify(ActionType.create_investigation_card, ctx)
+        decision = classify(ActionType.CREATE_INVESTIGATION_CARD, ctx)
         if decision.outcome != "agent_authorized":
             return False, f"rights_gate:{decision.outcome}"
     except ImportError:
-        # Rights module not yet available (sibling builder in progress).
-        # Still allow investigation cards with evidence — these are the
-        # safest possible Act (bounded scope, no deploy, no send).
-        pass
+        # Partial rollouts must not silently bypass the policy classifier.
+        return False, "rights_unavailable"
     except Exception as exc:
         # Any error from the rights module fails closed.
         _log.debug("decision rights error: %s", exc)
@@ -396,8 +404,8 @@ def run_once(
         raise RuntimeError("run_once requires an autocommit connection")
     if not isinstance(max_events, int) or not 1 <= max_events <= 1000:
         raise ValueError("max_events must be 1..1000")
-    if not isinstance(max_active_acts, int) or max_active_acts < 1:
-        raise ValueError("max_active_acts must be >= 1")
+    if type(max_active_acts) is not int or not 1 <= max_active_acts <= 2:
+        raise ValueError("max_active_acts must be 1..2")
     if not subscriber_id or not isinstance(subscriber_id, str):
         raise ValueError("subscriber_id must be a non-empty string")
     if not permitted_board or not isinstance(permitted_board, str):
@@ -458,47 +466,40 @@ def run_once(
                 continue
 
             # --- Decide ---
-            active_count = _count_active_ooda_acts(conn)
-            should_act, reason = _decide(
-                action_context,
-                max_active_acts=max_active_acts,
-                active_count=active_count,
-            )
-
-            if not should_act:
-                with write_txn(conn):
-                    event_bus.ack(conn, subscriber_id, evt.id)
-                events_skipped += 1
-                noop_reasons.append(f"decide_no:{reason}:{evt.id}")
-                continue
-
-            # --- Act ---
-            # Atomic: create investigation card + ACK event.
+            # Capacity, rights, card insertion and ACK share one IMMEDIATE write
+            # transaction. A second controller cannot race the capacity read.
             with write_txn(conn):
-                task_id = _act_create_investigation(
-                    conn, action_context,
-                    assignee=assignee,
-                    permitted_board=permitted_board,
-                    tenant=tenant,
+                active_count = _count_active_ooda_acts(conn)
+                should_act, reason = _decide(
+                    action_context,
+                    max_active_acts=max_active_acts,
+                    active_count=active_count,
                 )
-                event_bus.ack(conn, subscriber_id, evt.id)
-                if task_id is not None:
-                    acts_created += 1
-                else:
-                    # _act returns None for dedup (idempotency_key already exists)
-                    # or on failure.
+                if should_act:
                     idem_key = _stable_idempotency_key(
                         action_context["goal_id"],
                         action_context["metric_id"],
                         action_context["event_id"],
                     )
                     existing = conn.execute(
-                        "SELECT id FROM tasks WHERE idempotency_key = ?",
-                        (idem_key,),
+                        "SELECT id FROM tasks WHERE idempotency_key = ?", (idem_key,),
                     ).fetchone()
                     if existing:
                         acts_deduplicated += 1
-
+                    else:
+                        task_id = _act_create_investigation(
+                            conn, action_context,
+                            assignee=assignee,
+                            permitted_board=permitted_board,
+                            tenant=tenant,
+                        )
+                        if task_id is None:
+                            raise RuntimeError("investigation card not persisted; keep event pending")
+                        acts_created += 1
+                else:
+                    events_skipped += 1
+                    noop_reasons.append(f"decide_no:{reason}:{evt.id}")
+                event_bus.ack(conn, subscriber_id, evt.id)
             events_processed += 1
             continue
 

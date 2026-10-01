@@ -424,7 +424,7 @@ class TestRestartReplay:
                 conn,
                 subscriber_id="test-replay",
                 max_events=10,
-                max_active_acts=10,  # Allow many acts
+                max_active_acts=2,  # The global in-flight budget applies on replay.
                 permitted_board=db_path,
             )
             first_cards = conn.execute(
@@ -443,7 +443,7 @@ class TestRestartReplay:
                 conn,
                 subscriber_id="test-replay-2",
                 max_events=10,
-                max_active_acts=10,
+                max_active_acts=2,
                 permitted_board=db_path,
             )
 
