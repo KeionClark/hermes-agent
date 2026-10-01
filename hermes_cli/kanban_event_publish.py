@@ -169,6 +169,33 @@ def emit_status_changed(
     )
 
 
+def emit_run_completed(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: Optional[int] = None,
+    outcome: Optional[str] = None,
+) -> None:
+    """Emit ``run.completed`` on terminal run close (complete or fail).
+
+    Payload is restricted to the allowlisted triple {task_id, run_id, outcome}.
+    This is a NEW event type — no pre-existing ``run.completed`` exists in the
+    Kanban bus (the gateway SSE ``run.completed`` is unrelated).  Integration
+    owner must wire calls at each ``_end_run`` site in kanban_db.py and
+    kanban_db_dispatch.py (see call-site map in task handoff).
+    """
+    payload: dict = {"task_id": task_id}
+    if run_id is not None:
+        payload["run_id"] = run_id
+    if outcome is not None:
+        payload["outcome"] = outcome
+    _publish_safe(
+        conn,
+        event_type="run.completed",
+        payload=payload,
+    )
+
+
 def clear_bus_cache() -> None:
     """Reset the per-connection bus probe cache (for tests)."""
     _bus_probed.clear()
