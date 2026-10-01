@@ -31,8 +31,13 @@ exactly-once crossing and recovery events through the P0a event bus.
 
 The goal-metrics schema uses its own `goal_schema_version` table (singleton
 integer), independent of `PRAGMA user_version` (core kanban) and
-`hermes_event_schema_version` (P0a event bus). Migration runs automatically
-after the core schema and P0a bus migration via `kanban_db_connect.connect`.
+`hermes_event_schema_version` (P0a event bus). Goal schema migration is
+**not** run by `kanban_db_connect.connect` or `init_db`. It requires an
+explicit `ensure_goal_schema(conn)` call on the intended board connection,
+only after that board's migration and activation have been authorized. The
+canonical server board remains unmigrated during this dark-code release;
+private disposable TEST boards opt in explicitly for the witness. Goal CRUD
+fails closed with `GoalSchemaNotInitializedError` before that opt-in.
 
 - **Future schema**: If a newer schema version is detected, `RuntimeError` is
   raised (fail-closed; the binary is too old).
