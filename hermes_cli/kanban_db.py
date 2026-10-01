@@ -3817,6 +3817,7 @@ def resolve_block_and_requeue(
         )
         if cur.rowcount != 1:
             return False
+        _ep().emit_status_changed(conn, task_id, from_status="blocked", to_status=new_status)
         _append_event(conn, task_id, "block_resolved", {
             "actor": actor,
             "evidence_ref": evidence_ref,

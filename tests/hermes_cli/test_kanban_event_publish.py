@@ -85,6 +85,62 @@ def _bus_events(conn: sqlite3.Connection, event_type: Optional[str] = None) -> l
 # Tests
 # ---------------------------------------------------------------------------
 
+class TestEvidencedBlockResolution:
+    """Resolver status publication shares the disposable board transaction."""
+
+    @pytest.mark.parametrize("landing", ["ready", "todo", "review"])
+    def test_resolve_publishes_exactly_one_allowlisted_transition(self, board, landing):
+        conn, _ = board
+        from hermes_cli import kanban_db as kb
+
+        task_id = kb.create_task(conn, title="synthetic", assignee="builder", initial_status="blocked")
+        if landing == "todo":
+            parent = kb.create_task(conn, title="parent", assignee="builder")
+            conn.execute("INSERT INTO task_links(parent_id, child_id) VALUES (?, ?)", (parent, task_id))
+        elif landing == "review":
+            kb._append_event(conn, task_id, "blocked", {"source_status": "review"})
+        conn.commit()
+        before = len(_bus_events(conn, "card.status_changed"))
+
+        assert kb.resolve_block_and_requeue(
+            conn, task_id, actor="ops", evidence_ref="ref:0123456789abcdef",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == landing
+        changes = _bus_events(conn, "card.status_changed")[before:]
+        assert len(changes) == 1
+        assert changes[0]["payload"] == {
+            "task_id": task_id, "from": "blocked", "to": landing,
+        }
+        assert not kb.resolve_block_and_requeue(
+            conn, task_id, actor="ops", evidence_ref="ref:0123456789abcdef",
+        )
+        assert len(_bus_events(conn, "card.status_changed")) == before + 1
+
+    def test_rejected_and_rolled_back_resolution_publish_nothing(self, board):
+        conn, _ = board
+        from hermes_cli import kanban_db as kb
+
+        task_id = kb.create_task(conn, title="synthetic", assignee="builder", initial_status="blocked")
+        baseline = _bus_events(conn)
+        with pytest.raises(ValueError, match="evidence reference"):
+            kb.resolve_block_and_requeue(conn, task_id, actor="ops", evidence_ref="raw evidence")
+        assert _bus_events(conn) == baseline
+
+        # A real SQLite failure after status publication must undo task, audit and bus rows.
+        conn.execute("""CREATE TRIGGER fail_resolution_audit BEFORE INSERT ON task_events
+            WHEN NEW.kind = 'unblocked' BEGIN SELECT RAISE(ABORT, 'audit failure'); END""")
+        conn.commit()
+        with pytest.raises(sqlite3.IntegrityError, match="audit failure"):
+            kb.resolve_block_and_requeue(
+                conn, task_id, actor="ops", evidence_ref="ref:0123456789abcdef",
+            )
+        rolled_back_task = kb.get_task(conn, task_id)
+        assert rolled_back_task is not None and rolled_back_task.status == "blocked"
+        assert _bus_events(conn) == baseline
+        assert not any(e.kind == "block_resolved" for e in kb.list_events(conn, task_id))
+
+
 class TestCardCreated:
     """card.created is emitted once on successful task INSERT."""
 
