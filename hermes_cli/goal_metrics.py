@@ -179,10 +179,11 @@ CREATE INDEX IF NOT EXISTS idx_measurements_goal_id
 def migrate_goal_schema(conn: sqlite3.Connection) -> None:
     """Idempotent migration to the current goal-metrics schema version.
 
-    Called from ``kanban_db_connect.connect`` after the core schema and
-    P0a bus migration.  Uses ``goal_schema_version`` (singleton integer) —
-    independent of both ``PRAGMA user_version`` and
-    ``hermes_event_schema_version``.
+    **Not called from ``connect()``'s default init path** (t_539aaab5).
+    Callers must explicitly invoke ``ensure_goal_schema()`` on fresh or
+    disposable boards that opt into the goal system.  Uses
+    ``goal_schema_version`` (singleton integer) — independent of both
+    ``PRAGMA user_version`` and ``hermes_event_schema_version``.
 
     Wraps DDL in an explicit ``BEGIN IMMEDIATE`` / ``COMMIT`` pair for
     atomicity under the canonical ``isolation_level=None`` connection.
@@ -242,6 +243,32 @@ def migrate_goal_schema(conn: sqlite3.Connection) -> None:
         raise
 
 
+class GoalSchemaNotInitializedError(RuntimeError):
+    """Raised when goal CRUD is attempted on a board without goal tables.
+
+    The canonical board does not migrate goal tables on ``connect()``; they
+    are created only on fresh/disposable boards via explicit
+    ``ensure_goal_schema()``. This error is a fail-closed guard: callers must
+    not silently degrade or auto-migrate.
+    """
+
+
+def _require_goal_schema(conn: sqlite3.Connection) -> None:
+    """Fail closed if the goal-metrics schema has not been migrated on this
+    connection's board. A missing ``goals`` table means goal CRUD would hit
+    ``OperationalError: no such table`` — this gives a clear diagnostic
+    instead. Cheap: one ``sqlite_master`` SELECT, no write."""
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='goals'"
+    ).fetchone()
+    if row is None:
+        raise GoalSchemaNotInitializedError(
+            "Goal tables have not been created on this board. "
+            "Call ensure_goal_schema(conn) on a fresh/disposable board "
+            "before using goal CRUD functions."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Goal CRUD
 # ---------------------------------------------------------------------------
@@ -268,6 +295,7 @@ def create_goal(
         raise RuntimeError(
             "create_goal() requires an active write transaction"
         )
+    _require_goal_schema(conn)
 
     if goal_id is None:
         goal_id = str(uuid.uuid4())
@@ -344,6 +372,7 @@ def activate_goal(
         raise RuntimeError(
             "activate_goal() requires an active write transaction"
         )
+    _require_goal_schema(conn)
     if not approval_evidence_ref:
         raise ValueError("approval_evidence_ref is required for activation")
     if not isinstance(approval_timestamp, (int, float)):
@@ -374,6 +403,7 @@ def pause_goal(conn: sqlite3.Connection, goal_id: str) -> Goal:
     """
     if not getattr(conn, "in_transaction", False):
         raise RuntimeError("pause_goal() requires an active write transaction")
+    _require_goal_schema(conn)
 
     row = conn.execute(
         "SELECT * FROM goals WHERE id = ?", (goal_id,)
@@ -392,6 +422,7 @@ def pause_goal(conn: sqlite3.Connection, goal_id: str) -> Goal:
 
 def get_goal(conn: sqlite3.Connection, goal_id: str) -> Optional[Goal]:
     """Read a goal by ID. Returns None if not found."""
+    _require_goal_schema(conn)
     row = conn.execute(
         "SELECT * FROM goals WHERE id = ?", (goal_id,)
     ).fetchone()
@@ -404,6 +435,7 @@ def list_goals(
     state: Optional[GoalState] = None,
 ) -> list[Goal]:
     """List goals, optionally filtered by state."""
+    _require_goal_schema(conn)
     if state is not None:
         rows = conn.execute(
             "SELECT * FROM goals WHERE state = ? ORDER BY created_at",
@@ -524,6 +556,7 @@ def record_measurement(
         raise RuntimeError(
             "record_measurement() requires an active write transaction"
         )
+    _require_goal_schema(conn)
 
     # --- Input validation ---
     if not isinstance(value, (int, float)) or math.isnan(value) or math.isinf(value):

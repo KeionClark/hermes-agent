@@ -730,7 +730,10 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
                 conn.executescript(_kb.SCHEMA_SQL)
                 _migrate_add_optional_columns(conn)
                 _migrate_event_bus_schema(conn)
-                _migrate_goal_metrics_schema(conn)
+                # Goal-metrics schema is NOT migrated here: the canonical board
+                # must remain schema-preserving on every connect/restart. Goal
+                # tables are created only via explicit ``ensure_goal_schema()``
+                # on fresh/disposable boards that opt in. See t_539aaab5.
                 _INITIALIZED_PATHS.add(resolved)
 
         conn, _ = _open_configured(path, _init_if_needed)
@@ -877,9 +880,25 @@ def _migrate_goal_metrics_schema(conn: sqlite3.Connection) -> None:
 
     Uses ``conn.execute`` (not ``executescript``) so it participates in the
     caller's active transaction.  Idempotent; safe on fresh and legacy boards.
+
+    .. note:: Removed from the default ``connect()`` init path (t_539aaab5).
+       Called only by :func:`ensure_goal_schema` on explicit opt-in.
     """
     from hermes_cli.goal_metrics import migrate_goal_schema
     migrate_goal_schema(conn)
+
+
+def ensure_goal_schema(conn: sqlite3.Connection) -> None:
+    """Explicitly migrate goal-metrics tables on an already-open connection.
+
+    Call this on fresh or disposable boards that opt into the goal system.
+    The canonical (serving) board's ``connect()`` never calls this; a restart
+    or gateway reconnect leaves the canonical board schema-preserving with no
+    OODA target/consumer activation.  See t_539aaab5.
+
+    Idempotent: safe to call on a board that already has the tables.
+    """
+    _migrate_goal_metrics_schema(conn)
 
 
 def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
