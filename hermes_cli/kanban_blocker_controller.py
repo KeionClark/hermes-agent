@@ -302,7 +302,7 @@ Description=Run Hermes Kanban blocker controller every 15 minutes
 [Timer]
 OnBootSec=2m
 OnActiveSec=2m
-OnUnitActiveSec=15m
+OnUnitActiveSec=2m
 RandomizedDelaySec=60
 Persistent=true
 
