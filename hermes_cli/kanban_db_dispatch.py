@@ -1531,6 +1531,12 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     whose bare-PID kill authority a new spawn must not inherit."""
     started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
     with _kb.write_txn(conn):
+        existing = conn.execute(
+            "SELECT worker_pid, worker_started_at FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if (existing is not None and existing["worker_pid"] == int(pid)
+                and existing["worker_started_at"] not in (None, UNVERIFIED_WORKER_FINGERPRINT)):
+            started_at = existing["worker_started_at"]
         conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
                      (int(pid), started_at, task_id))
         run_id = _kb._current_run_id(conn, task_id)

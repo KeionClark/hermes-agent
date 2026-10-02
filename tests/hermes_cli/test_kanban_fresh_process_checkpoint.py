@@ -128,6 +128,20 @@ def test_staging_requires_matching_verified_worker_fingerprint(kanban_home, tmp_
         assert conn.execute("SELECT 1 FROM fresh_process_checkpoints WHERE task_id = ?", (tid,)).fetchone() is None
 
 
+def test_dispatcher_pid_write_preserves_verified_worker_registration_after_staging(kanban_home, tmp_path, monkeypatch):
+    repo = _repo(tmp_path / "repo")
+    with kbc.connect() as conn:
+        tid, run_id = _claimed(conn, repo)
+        handoff = {"summary": "done", "next_step": "continue", "external_actions": []}
+        assert kb.stage_fresh_process_checkpoint(conn, tid, handoff=handoff, delay_seconds=1,
+                                                 expected_run_id=run_id, workspace=str(repo))
+        monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: None)
+        kbd._set_worker_pid(conn, tid, 424242)
+        task = conn.execute("SELECT worker_started_at FROM tasks WHERE id = ?", (tid,)).fetchone()
+        run = conn.execute("SELECT worker_started_at FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        assert task["worker_started_at"] == run["worker_started_at"] == 1
+
+
 def test_fresh_process_checkpoint_holds_changed_workspace_and_rejects_external_actions(kanban_home, tmp_path, monkeypatch):
     repo = _repo(tmp_path / "repo")
     with kbc.connect() as conn:
