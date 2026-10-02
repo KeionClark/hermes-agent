@@ -123,7 +123,7 @@ def test_systemd_text_is_bounded_and_not_installed(kanban_home: Path) -> None:
     from hermes_cli.kanban_blocker_controller import systemd_units
     units = systemd_units()
     assert "OnUnitActiveSec=15m" in units["timer"]
-    assert "--apply --json" in units["service"]
+    assert "hermes --run-module hermes_cli.kanban_blocker_controller --apply --json" in units["service"]
 
 
 def test_workspace_crash_root_is_classified_before_one_resolver(kanban_home: Path) -> None:

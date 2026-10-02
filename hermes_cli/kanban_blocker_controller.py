@@ -242,7 +242,7 @@ Description=Hermes Kanban blocker controller
 Type=oneshot
 User=hermes
 WorkingDirectory=/var/lib/hermes/.hermes/hermes-agent
-ExecStart=/usr/bin/env python3 -m hermes_cli.kanban_blocker_controller --apply --json
+ExecStart=/var/lib/hermes/.local/bin/hermes --run-module hermes_cli.kanban_blocker_controller --apply --json
 NoNewPrivileges=true
 """,
         "timer": """[Unit]
