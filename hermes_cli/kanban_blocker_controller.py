@@ -33,14 +33,15 @@ def _root_gate(conn: sqlite3.Connection, task_id: str) -> sqlite3.Row:
     """Return the oldest operator-facing blocked ancestor, or the card itself."""
     row = conn.execute(
         """
-        WITH RECURSIVE upstream(id) AS (
-            SELECT id FROM tasks WHERE id = ?
-            UNION
-            SELECT links.parent_id FROM task_links AS links JOIN upstream ON links.child_id = upstream.id
+        WITH RECURSIVE upstream(id, depth) AS (
+            SELECT id, 0 FROM tasks WHERE id = ?
+            UNION ALL
+            SELECT links.parent_id, upstream.depth + 1
+              FROM task_links AS links JOIN upstream ON links.child_id = upstream.id
         )
         SELECT tasks.* FROM tasks JOIN upstream ON upstream.id = tasks.id
          WHERE tasks.status = 'blocked' AND tasks.block_kind IN (?, ?)
-         ORDER BY tasks.created_at ASC, tasks.id ASC LIMIT 1
+         ORDER BY upstream.depth ASC, tasks.id ASC LIMIT 1
         """, (task_id, *ROOT_BLOCK_KINDS),
     ).fetchone()
     if row is not None:
@@ -92,10 +93,14 @@ def controller_tick(
 
     ledger: list[dict[str, Any]] = []
     escalations: list[dict[str, Any]] = []
-    for root_id in sorted(grouped, key=lambda tid: (-int(roots[tid]["priority"] or 0), tid)):
+    def effective_priority(root_id: str) -> int:
+        return max(int(row["priority"] or 0) for row in grouped[root_id])
+
+    for root_id in sorted(grouped, key=lambda tid: (-effective_priority(tid), tid)):
         root = roots[root_id]
+        priority = effective_priority(root_id)
         last_check_at, reason = _gate_activity(conn, root_id)
-        interval = 60 * 60 if int(root["priority"] or 0) >= 90 else 6 * 60 * 60
+        interval = 60 * 60 if priority >= 90 else 6 * 60 * 60
         next_check_at = last_check_at + interval
         member_ids = [row["id"] for row in grouped[root_id]]
         entry = {
@@ -103,6 +108,7 @@ def controller_tick(
             "owner": root["assignee"],
             "reason": reason,
             "block_kind": root["block_kind"],
+            "effective_priority": priority,
             "last_check_at": last_check_at,
             "next_check_at": next_check_at,
             "blocked_task_ids": member_ids,
@@ -113,10 +119,11 @@ def controller_tick(
         if now >= next_check_at:
             escalations.append({
                 "kind": "gate_check_due",
-                "severity": "critical" if int(root["priority"] or 0) >= 90 else "warning",
+                "severity": "critical" if priority >= 90 else "warning",
                 "root_gate_id": root_id,
                 "owner": root["assignee"],
                 "reason": reason,
+                "effective_priority": priority,
                 "next_check_at": next_check_at,
                 "action": "verify_changed_condition",
                 "command": f"hermes kanban show {root_id}",
@@ -125,10 +132,11 @@ def controller_tick(
         if now >= last_check_at + stale_gate_seconds:
             escalations.append({
                 "kind": "stale_gate",
-                "severity": "critical" if int(root["priority"] or 0) >= 90 else "warning",
+                "severity": "critical" if priority >= 90 else "warning",
                 "root_gate_id": root_id,
                 "owner": root["assignee"],
                 "reason": reason,
+                "effective_priority": priority,
                 "last_check_at": last_check_at,
                 "action": "verify_changed_condition",
                 "command": f"hermes kanban show {root_id}",
@@ -155,64 +163,115 @@ def controller_tick(
     return {"generated_at": now, "ledger": ledger, "escalations": escalations}
 
 
-def apply_tick(
-    conn: sqlite3.Connection, report: dict[str, Any], *, author: str = "blocker-controller",
-    dispatch_once_fn=None,
-) -> dict[str, Any]:
-    """Apply one bounded wake-up pass without unblocking or creating cards.
+def _resolver_purpose(reason: str) -> str:
+    return "verify changed condition: " + " ".join(reason.split())[:120]
 
-    One marker comment is written per due/stale root condition. Existing markers
-    are durable idempotency receipts. A single normal dispatch pass is requested
-    when at least one ready card is starved; callers may inject it for testing.
+
+def _workspace_capability(conn: sqlite3.Connection, root_id: str) -> bool:
+    row = conn.execute("SELECT last_failure_error FROM tasks WHERE id = ?", (root_id,)).fetchone()
+    text = str(row["last_failure_error"] or "") if row else ""
+    text += " " + " ".join(str(_event_payload(event).get("reason") or "")
+                              for event in conn.execute("SELECT payload FROM task_events WHERE task_id = ?", (root_id,)))
+    lowered = text.casefold()
+    return any(token in lowered for token in ("workspace", "checkout", "no such file", "route", "repository"))
+
+
+def apply_tick(conn: sqlite3.Connection, report: dict[str, Any], *, author: str = "blocker-controller",
+               max_resolvers: int = 1) -> dict[str, Any]:
+    """Perform one bounded wake-up: one resolver and targeted Ready alerts.
+
+    A resolver is a runnable, idempotent task under the exact blocked-root
+    admission contract. It carries lineage only, never a blocking parent edge.
+    No elapsed time path unblocks a card or recreates a downstream graph.
     """
-    by_root: dict[str, dict[str, Any]] = {}
-    ready_starved = False
+    due: dict[str, dict[str, Any]] = {}
+    ready: list[dict[str, Any]] = []
     for escalation in report.get("escalations", []):
         if escalation.get("kind") == "ready_starvation":
-            ready_starved = True
-            continue
-        if escalation.get("kind") not in {"gate_check_due", "stale_gate"}:
-            continue
+            ready.append(escalation)
+        elif escalation.get("kind") in {"gate_check_due", "stale_gate"}:
+            root_id = escalation["root_gate_id"]
+            if root_id not in due or escalation["kind"] == "stale_gate":
+                due[root_id] = escalation
+
+    resolver_ids: list[str] = []
+    commented_ready_ids: list[str] = []
+    ordered = sorted(due.values(), key=lambda item: (item["severity"] != "critical", item["root_gate_id"]))
+    for escalation in ordered[:max_resolvers]:
         root_id = escalation["root_gate_id"]
-        prior = by_root.get(root_id)
-        if prior is None or escalation["kind"] == "stale_gate":
-            by_root[root_id] = escalation
-
-    commented: list[str] = []
-    with kb.write_txn(conn):
-        for root_id, escalation in sorted(by_root.items()):
-            marker = f"[blocker-controller:{escalation['escalation_key']}]"
-            existing = kb.list_comments(conn, root_id)
-            if any(marker in comment.body for comment in existing):
+        root = kb.get_task(conn, root_id)
+        if root is None or not root.assignee:
+            continue
+        reason = str(escalation.get("reason") or "no explicit block reason recorded")
+        if root.block_kind not in ROOT_BLOCK_KINDS:
+            if not _workspace_capability(conn, root_id):
                 continue
-            owner = escalation.get("owner") or "unassigned"
-            reason = str(escalation.get("reason") or "no explicit block reason recorded")[:500]
-            body = (
-                f"{marker} Owner: @{owner}. Changed condition: {reason}. "
-                "Next permitted action: verify that condition and use resolve-block with evidence. "
-                "This controller does not unblock or create downstream tasks."
-            )
-            kb.add_comment(conn, root_id, author, body)
-            commented.append(root_id)
+            kb.block_task(conn, root_id, reason="capability: verify workspace/repository route", kind="capability")
+            root = kb.get_task(conn, root_id)
+        purpose = _resolver_purpose(reason)
+        key = kb.blocked_root_resolver_idempotency_key(root_id, purpose)
+        resolver_ids.append(kb.create_task(
+            conn, title=f"Resolve gate: {root.title}",
+            body=("Verify this specific changed condition before resolving the root: " + reason),
+            assignee=root.assignee, priority=max(90, int(escalation.get("effective_priority") or 0)),
+            created_by=author, creator_task_id=root_id,
+            blocked_root_resolver_for=root_id, blocked_root_resolver_purpose=purpose,
+            idempotency_key=key,
+        ))
 
-    dispatched = False
-    if ready_starved:
-        if dispatch_once_fn is None:
-            from hermes_cli import kanban_db_dispatch as kbd
-            dispatch_once_fn = kbd.dispatch_once
-        dispatch_once_fn(conn, max_spawn=1)
-        dispatched = True
-    return {"commented_root_ids": commented, "dispatch_requested": dispatched}
+    with kb.write_txn(conn):
+        for escalation in ready:
+            task_id = escalation["task_id"]
+            marker = f"[blocker-controller:{escalation['escalation_key']}]"
+            if any(marker in comment.body for comment in kb.list_comments(conn, task_id)):
+                continue
+            kb.add_comment(conn, task_id, author,
+                           f"{marker} Ready starvation recorded for @{escalation.get('owner') or 'unassigned'}. "
+                           "Targeted action: inspect this card's dispatcher/profile capacity; no unrelated card was dispatched.")
+            commented_ready_ids.append(task_id)
+    return {"resolver_task_ids": resolver_ids, "ready_alert_task_ids": commented_ready_ids}
+
+
+def systemd_units() -> dict[str, str]:
+    """Installable, bounded 15-minute controller units; returned for review first."""
+    return {
+        "service": """[Unit]
+Description=Hermes Kanban blocker controller
+
+[Service]
+Type=oneshot
+User=hermes
+WorkingDirectory=/var/lib/hermes/.hermes/hermes-agent
+ExecStart=/usr/bin/env python3 -m hermes_cli.kanban_blocker_controller --apply --json
+NoNewPrivileges=true
+""",
+        "timer": """[Unit]
+Description=Run Hermes Kanban blocker controller every 15 minutes
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=15m
+RandomizedDelaySec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+""",
+    }
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Read-only Kanban blocker controller tick")
     parser.add_argument("--json", action="store_true", help="Emit JSON (the scheduler/notifier integration format)")
     parser.add_argument("--now", type=int, help="Epoch time for deterministic replay")
-    parser.add_argument("--apply", action="store_true", help="Post idempotent root wake-up comments and dispatch one starved Ready card")
+    parser.add_argument("--apply", action="store_true", help="Create at most one idempotent root resolver and targeted Ready alerts")
+    parser.add_argument("--print-systemd", action="store_true", help="Print reviewed service/timer text without installing it")
     parser.add_argument("--stale-gate-seconds", type=int, default=DEFAULT_STALE_GATE_SECONDS)
     parser.add_argument("--ready-starvation-seconds", type=int, default=DEFAULT_READY_STARVATION_SECONDS)
     args = parser.parse_args(list(argv) if argv is not None else None)
+    if args.print_systemd:
+        print(json.dumps(systemd_units(), sort_keys=True))
+        return 0
     with kbc.connect_closing() as conn:
         report = controller_tick(
             conn, now=args.now, stale_gate_seconds=args.stale_gate_seconds,

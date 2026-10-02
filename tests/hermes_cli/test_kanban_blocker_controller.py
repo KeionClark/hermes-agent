@@ -51,6 +51,7 @@ def test_tick_groups_blocked_descendants_at_exact_root_and_is_read_only(kanban_h
         "owner": "chief",
         "reason": "awaiting external access",
         "block_kind": "needs_input",
+        "effective_priority": 100,
         "last_check_at": blocked_at,
         "next_check_at": blocked_at + 60 * 60,
         "blocked_task_ids": [root, child],
@@ -78,7 +79,7 @@ def test_recent_gate_does_not_escalate_and_intervals_must_be_positive(kanban_hom
             controller_tick(conn, now=blocked_at, stale_gate_seconds=0)
 
 
-def test_apply_posts_one_idempotent_root_wake_up_and_dispatches_once(kanban_home: Path) -> None:
+def test_apply_creates_one_runnable_resolver_and_targets_ready_alert(kanban_home: Path) -> None:
     with kbc.connect() as conn:
         root = kb.create_task(conn, title="access gate", assignee="chief", priority=100)
         blocked_at = _block(conn, root)
@@ -87,24 +88,52 @@ def test_apply_posts_one_idempotent_root_wake_up_and_dispatches_once(kanban_home
             conn, now=blocked_at + 25 * 60 * 60,
             stale_gate_seconds=24 * 60 * 60, ready_starvation_seconds=60 * 60,
         )
-        calls = []
-        first = apply_tick(conn, report, dispatch_once_fn=lambda *_args, **kwargs: calls.append(kwargs))
+        first = apply_tick(conn, report)
         event_count = conn.execute("SELECT count(*) FROM task_events").fetchone()[0]
         task_count = conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
-        comments = kb.list_comments(conn, root)
-        second_report = controller_tick(
-            conn, now=comments[0].created_at + 10,
-            stale_gate_seconds=24 * 60 * 60, ready_starvation_seconds=60 * 60,
-        )
-        second = apply_tick(conn, second_report, dispatch_once_fn=lambda *_args, **kwargs: calls.append(kwargs))
+        second = apply_tick(conn, report)
 
-        assert len(comments) == 1
-        assert "[blocker-controller:stale-gate:" in comments[0].body
-        assert "resolve-block with evidence" in comments[0].body
-        assert first == {"commented_root_ids": [root], "dispatch_requested": True}
-        assert second == {"commented_root_ids": [], "dispatch_requested": False}
-        assert calls == [{"max_spawn": 1}]
+        assert len(first["resolver_task_ids"]) == 1
+        resolver = kb.get_task(conn, first["resolver_task_ids"][0])
+        assert resolver.status == "ready"
+        assert resolver.assignee == "chief"
+        assert first["ready_alert_task_ids"] == [ready]
+        assert second["resolver_task_ids"] == first["resolver_task_ids"]
+        assert second["ready_alert_task_ids"] == []
         assert conn.execute("SELECT count(*) FROM task_events").fetchone()[0] == event_count
         assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == task_count
         assert kb.get_task(conn, root).status == "blocked"
-        assert kb.get_task(conn, ready).status == "ready"
+        assert len(kb.list_comments(conn, ready)) == 1
+
+
+def test_nearest_gate_and_descendant_priority_win(kanban_home: Path) -> None:
+    with kbc.connect() as conn:
+        outer = kb.create_task(conn, title="outer", assignee="chief", priority=10)
+        blocked_at = _block(conn, outer)
+        inner = kb.create_task(conn, title="inner", assignee="chief", parents=[outer], initial_status="blocked")
+        assert kb.block_task(conn, inner, reason="inner capability", kind="capability")
+        child = kb.create_task(conn, title="urgent child", assignee="chief", parents=[inner], initial_status="blocked", priority=100)
+        report = controller_tick(conn, now=blocked_at + 61 * 60)
+        entry = next(item for item in report["ledger"] if child in item["blocked_task_ids"])
+        assert entry["root_gate_id"] == inner
+        assert entry["effective_priority"] == 100
+
+
+def test_systemd_text_is_bounded_and_not_installed(kanban_home: Path) -> None:
+    from hermes_cli.kanban_blocker_controller import systemd_units
+    units = systemd_units()
+    assert "OnUnitActiveSec=15m" in units["timer"]
+    assert "--apply --json" in units["service"]
+
+
+def test_workspace_crash_root_is_classified_before_one_resolver(kanban_home: Path) -> None:
+    with kbc.connect() as conn:
+        root = kb.create_task(conn, title="missing checkout", assignee="release", initial_status="blocked")
+        conn.execute("UPDATE tasks SET last_failure_error = ? WHERE id = ?", ("workspace checkout route missing", root))
+        conn.commit()
+        blocked_at = max(event.created_at for event in kb.list_events(conn, root) if event.kind == "blocked")
+        report = controller_tick(conn, now=blocked_at + 25 * 60 * 60)
+        applied = apply_tick(conn, report)
+        assert kb.get_task(conn, root).block_kind == "capability"
+        assert len(applied["resolver_task_ids"]) == 1
+        assert kb.get_task(conn, applied["resolver_task_ids"][0]).status == "ready"
