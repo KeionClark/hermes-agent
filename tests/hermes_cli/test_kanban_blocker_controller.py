@@ -137,3 +137,33 @@ def test_workspace_crash_root_is_classified_before_one_resolver(kanban_home: Pat
         assert kb.get_task(conn, root).block_kind == "capability"
         assert len(applied["resolver_task_ids"]) == 1
         assert kb.get_task(conn, applied["resolver_task_ids"][0]).status == "ready"
+
+
+def test_terminal_resolver_waits_for_explicit_changed_condition_marker(kanban_home: Path) -> None:
+    with kbc.connect() as conn:
+        root = kb.create_task(conn, title="access gate", assignee="chief", priority=100)
+        blocked_at = _block(conn, root)
+        report = controller_tick(conn, now=blocked_at + 25 * 60 * 60)
+        first = apply_tick(conn, report)
+        resolver_id = first["resolver_task_ids"][0]
+        assert kb.claim_task(conn, resolver_id)
+        assert kb.complete_task(conn, resolver_id, result="condition still unavailable")
+        assert kb.get_task(conn, root).status == "blocked"
+        assert apply_tick(conn, report)["resolver_task_ids"] == []
+
+        kb.add_comment(conn, root, "chief", "[changed-condition] repository route has been restored")
+        changed = apply_tick(conn, report)
+        assert len(changed["resolver_task_ids"]) == 1
+        assert changed["resolver_task_ids"][0] != resolver_id
+        assert kb.get_task(conn, changed["resolver_task_ids"][0]).status == "ready"
+
+
+def test_apply_selects_highest_priority_critical_root_first(kanban_home: Path) -> None:
+    with kbc.connect() as conn:
+        low = kb.create_task(conn, title="P90 root", assignee="chief", priority=90)
+        high = kb.create_task(conn, title="P100 root", assignee="chief", priority=100)
+        low_at, high_at = _block(conn, low), _block(conn, high)
+        report = controller_tick(conn, now=max(low_at, high_at) + 25 * 60 * 60)
+        applied = apply_tick(conn, report, max_resolvers=1)
+        resolver = kb.get_task(conn, applied["resolver_task_ids"][0])
+        assert "P100 root" in resolver.title

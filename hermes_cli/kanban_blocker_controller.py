@@ -163,8 +163,16 @@ def controller_tick(
     return {"generated_at": now, "ledger": ledger, "escalations": escalations}
 
 
-def _resolver_purpose(reason: str) -> str:
-    return "verify changed condition: " + " ".join(reason.split())[:120]
+def _condition_revision(conn: sqlite3.Connection, root_id: str) -> str:
+    """Explicit operator evidence advances a terminal resolver's retry identity."""
+    for comment in reversed(kb.list_comments(conn, root_id)):
+        if comment.author != "blocker-controller" and "[changed-condition]" in comment.body.casefold():
+            return f"comment-{comment.id}"
+    return "initial"
+
+
+def _resolver_purpose(conn: sqlite3.Connection, root_id: str, reason: str) -> str:
+    return "verify changed condition " + _condition_revision(conn, root_id) + ": " + " ".join(reason.split())[:90]
 
 
 def _workspace_capability(conn: sqlite3.Connection, root_id: str) -> bool:
@@ -196,7 +204,15 @@ def apply_tick(conn: sqlite3.Connection, report: dict[str, Any], *, author: str 
 
     resolver_ids: list[str] = []
     commented_ready_ids: list[str] = []
-    ordered = sorted(due.values(), key=lambda item: (item["severity"] != "critical", item["root_gate_id"]))
+    ordered = sorted(
+        due.values(),
+        key=lambda item: (
+            item["severity"] != "critical",
+            -int(item.get("effective_priority") or 0),
+            item["kind"] != "stale_gate",
+            item["root_gate_id"],
+        ),
+    )
     for escalation in ordered[:max_resolvers]:
         root_id = escalation["root_gate_id"]
         root = kb.get_task(conn, root_id)
@@ -208,8 +224,11 @@ def apply_tick(conn: sqlite3.Connection, report: dict[str, Any], *, author: str 
                 continue
             kb.block_task(conn, root_id, reason="capability: verify workspace/repository route", kind="capability")
             root = kb.get_task(conn, root_id)
-        purpose = _resolver_purpose(reason)
+        purpose = _resolver_purpose(conn, root_id, reason)
         key = kb.blocked_root_resolver_idempotency_key(root_id, purpose)
+        existing = conn.execute("SELECT id, status FROM tasks WHERE idempotency_key = ?", (key,)).fetchone()
+        if existing is not None and existing["status"] in {"done", "archived"}:
+            continue
         resolver_ids.append(kb.create_task(
             conn, title=f"Resolve gate: {root.title}",
             body=("Verify this specific changed condition before resolving the root: " + reason),
