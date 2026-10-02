@@ -110,6 +110,24 @@ def test_fresh_process_checkpoint_settles_same_card_into_new_run_and_narrow_cont
         assert "Prior attempts" not in context and "Comments" not in context
 
 
+def test_staging_requires_matching_verified_worker_fingerprint(kanban_home, tmp_path):
+    repo = _repo(tmp_path / "repo")
+    with kbc.connect() as conn:
+        tid, run_id = _claimed(conn, repo)
+        handoff = {"summary": "done", "next_step": "continue", "external_actions": []}
+        for fingerprint in (None, "unverified"):
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET worker_started_at = ? WHERE id = ?", (fingerprint, tid))
+                conn.execute("UPDATE task_runs SET worker_started_at = ? WHERE id = ?", (fingerprint, run_id))
+            assert not kb.stage_fresh_process_checkpoint(conn, tid, handoff=handoff, delay_seconds=1,
+                                                         expected_run_id=run_id, workspace=str(repo))
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET worker_started_at = 1 WHERE id = ?", (tid,))
+        assert not kb.stage_fresh_process_checkpoint(conn, tid, handoff=handoff, delay_seconds=1,
+                                                     expected_run_id=run_id, workspace=str(repo))
+        assert conn.execute("SELECT 1 FROM fresh_process_checkpoints WHERE task_id = ?", (tid,)).fetchone() is None
+
+
 def test_fresh_process_checkpoint_holds_changed_workspace_and_rejects_external_actions(kanban_home, tmp_path, monkeypatch):
     repo = _repo(tmp_path / "repo")
     with kbc.connect() as conn:
