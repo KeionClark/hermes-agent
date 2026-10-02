@@ -162,7 +162,8 @@ def test_merged_blocked_roots_choose_one_resolver_scope(kanban_home: Path) -> No
 def test_systemd_text_is_bounded_and_not_installed(kanban_home: Path) -> None:
     from hermes_cli.kanban_blocker_controller import systemd_units
     units = systemd_units()
-    assert "OnUnitActiveSec=15m" in units["timer"]
+    assert "OnActiveSec=2m" in units["timer"]
+    assert "OnUnitActiveSec=2m" in units["timer"]
     assert "hermes --run-module hermes_cli.kanban_blocker_controller --apply --json" in units["service"]
 
 
