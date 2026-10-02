@@ -4466,6 +4466,10 @@ def stage_fresh_process_checkpoint(
         ).fetchone()
         opted = conn.execute("SELECT payload FROM task_events WHERE task_id = ? "
                              "AND kind = 'fresh_process_checkpoint_opt_in' ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+        spawned = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind = 'spawned' ORDER BY id DESC LIMIT 1", (task_id, int(expected_run_id)),
+        ).fetchone()
         run = conn.execute("SELECT task_id, status, claim_lock, worker_pid, worker_started_at, ended_at "
                            "FROM task_runs WHERE id = ?", (int(expected_run_id),)).fetchone()
         if (row is None or row["status"] != "running" or row["current_run_id"] != int(expected_run_id)
@@ -4473,6 +4477,9 @@ def stage_fresh_process_checkpoint(
                 or row["claim_expires"] is None or int(row["claim_expires"]) < int(time.time())
                 or row["worker_pid"] is None or int(row["worker_pid"]) <= 0
                 or row["worker_started_at"] in (None, "unverified")
+                or spawned is None
+                or _json_dict(spawned["payload"]).get("pid") != row["worker_pid"]
+                or _json_dict(spawned["payload"]).get("started_at") != row["worker_started_at"]
                 or row["workspace_kind"] not in ("dir", "worktree") or row["workspace_path"] != workspace
                 or opted is None or _json_dict(opted["payload"]).get("workspace") != workspace
                 or run is None or run["task_id"] != task_id or run["status"] != "running"

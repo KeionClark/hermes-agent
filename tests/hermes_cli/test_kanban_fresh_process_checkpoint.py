@@ -50,6 +50,7 @@ def _claimed(conn, repo: Path) -> tuple[str, int]:
         )
         conn.execute("UPDATE task_runs SET worker_pid = 424242, worker_started_at = 1 WHERE id = ?",
                      (task.current_run_id,))
+        kb._append_event(conn, tid, "spawned", {"pid": 424242, "started_at": 1}, run_id=task.current_run_id)
     return tid, task.current_run_id
 
 
@@ -140,6 +141,26 @@ def test_dispatcher_pid_write_preserves_verified_worker_registration_after_stagi
         task = conn.execute("SELECT worker_started_at FROM tasks WHERE id = ?", (tid,)).fetchone()
         run = conn.execute("SELECT worker_started_at FROM task_runs WHERE id = ?", (run_id,)).fetchone()
         assert task["worker_started_at"] == run["worker_started_at"] == 1
+
+
+def test_staging_waits_for_dispatcher_spawn_identity_with_distinct_wrapper_pid(kanban_home, tmp_path, monkeypatch):
+    repo = _repo(tmp_path / "repo")
+    with kbc.connect() as conn:
+        tid, run_id = _claimed(conn, repo)
+        handoff = {"summary": "done", "next_step": "continue", "external_actions": []}
+        with kb.write_txn(conn):
+            conn.execute("DELETE FROM task_events WHERE task_id = ? AND run_id = ? AND kind = 'spawned'",
+                         (tid, run_id))
+        assert not kb.stage_fresh_process_checkpoint(conn, tid, handoff=handoff, delay_seconds=1,
+                                                     expected_run_id=run_id, workspace=str(repo))
+        monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: None)
+        kbd._set_worker_pid(conn, tid, 434343)
+        assert not kb.stage_fresh_process_checkpoint(conn, tid, handoff=handoff, delay_seconds=1,
+                                                     expected_run_id=run_id, workspace=str(repo))
+        monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: 2)
+        kbd._set_worker_pid(conn, tid, 434343)
+        assert kb.stage_fresh_process_checkpoint(conn, tid, handoff=handoff, delay_seconds=1,
+                                                expected_run_id=run_id, workspace=str(repo))
 
 
 def test_fresh_process_checkpoint_holds_changed_workspace_and_rejects_external_actions(kanban_home, tmp_path, monkeypatch):
