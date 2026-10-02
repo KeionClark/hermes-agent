@@ -68,6 +68,7 @@ def test_dependency_parent_states_and_archived_predecessor(board):
     assert kb.get_task(board, parent).status == "blocked"
     migrate(board)
     consume(board)
+    assert len(kb.list_comments(board, child)) == 1
     assert kb.archive_task(board, parent)
     assert kb.get_task(board, child).status == "todo"
     assert kb.unsatisfied_parents(board, child) == [(parent, "archived")]
@@ -128,6 +129,9 @@ def test_outcome_only_after_real_ready_or_running_transition(board):
     first = consume(board)["diagnoses"][0]
     board.execute("UPDATE tasks SET status='todo' WHERE id=?", (task,))
     kb._append_event(board, task, "status", {"to_status": "todo"})
+    board.commit()
+    assert not consume(board)["outcomes"]
+    kb._append_event(board, task, "promoted", {"status": "review"})
     board.commit()
     assert not consume(board)["outcomes"]
     board.execute("UPDATE tasks SET status='ready' WHERE id=?", (task,))

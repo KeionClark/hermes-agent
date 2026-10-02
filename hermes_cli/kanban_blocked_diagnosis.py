@@ -116,7 +116,10 @@ def _receipt(conn: sqlite3.Connection, diagnosis: dict[str, Any], action: str, n
     inserted = conn.execute(
         "INSERT OR IGNORE INTO blocked_diagnosis_receipts VALUES (?, ?, ?, ?)",
         (task_id, event_id, action, now)).rowcount
-    if inserted and diagnosis["status"] == "blocked":
+    if inserted and (
+        (action == "diagnose" and diagnosis["status"] in {"blocked", "todo"})
+        or (action == "idle-4h" and diagnosis["status"] in {"blocked", "todo"})
+    ):
         kb.add_comment(conn, task_id, AUTHOR,
             f"[blocked-diagnosis:{event_id}:{action}] @{diagnosis['owner'] or 'unassigned'}: "
             f"{diagnosis['route']}. Evidence: {diagnosis['evidence']}. "
@@ -128,7 +131,7 @@ def _outcome(conn: sqlite3.Connection, row: sqlite3.Row, route: str) -> dict[str
     events = conn.execute("SELECT id, kind, payload, created_at FROM task_events WHERE task_id = ? AND id > ? ORDER BY id",
                           (row["task_id"], row["id"])).fetchall()
     for event in events:
-        if event["kind"] == "blocked":
+        if event["kind"] in {"blocked", "dependency_wait", "block_loop_detected"}:
             break
         # Do not mistake blocked -> todo for resolution; only a real ready/running transition.
         if event["kind"] in {"unblocked", "promoted", "claimed", "status"}:
@@ -137,7 +140,7 @@ def _outcome(conn: sqlite3.Connection, row: sqlite3.Row, route: str) -> dict[str
             if event["kind"] == "unblocked" and not payload:
                 destination = "ready"
             if event["kind"] == "promoted":
-                destination = "ready"
+                destination = payload.get("status", "ready")
             if event["kind"] == "claimed":
                 destination = "running"
             if destination in {"ready", "running"}:
@@ -160,10 +163,12 @@ def consume(conn: sqlite3.Connection, *, now: int | None = None, limit: int = BA
         rows = conn.execute("SELECT id, task_id, kind, payload, created_at FROM task_events WHERE id > ? ORDER BY id LIMIT ?",
                             (cursor["event_id"], limit)).fetchall()
         for event in rows:
-            if event["kind"] == "blocked":
+            if event["kind"] in {"blocked", "block_loop_detected"} or (
+                event["kind"] == "dependency_wait" and _payload(event).get("kind") == "dependency"
+            ):
                 diagnosis = _diagnose(conn, event, now)
                 diagnoses.append(diagnosis)
-                if diagnosis["status"] == "blocked":
+                if diagnosis["status"] in {"blocked", "todo"}:
                     _receipt(conn, diagnosis, "diagnose", now)
             conn.execute("UPDATE blocked_diagnosis_cursor SET event_id = ? WHERE singleton=1", (event["id"],))
         # Only previously diagnosed blocks, bounded by the receipt table and live state.
@@ -173,7 +178,7 @@ def consume(conn: sqlite3.Connection, *, now: int | None = None, limit: int = BA
             "WHERE r.action = 'diagnose' ORDER BY e.id LIMIT ?", (limit,)).fetchall()
         for row in candidates:
             diagnosis = _diagnose(conn, row, now)
-            if diagnosis["status"] == "blocked" and diagnosis["idle_seconds"] >= IDLE_SECONDS:
+            if diagnosis["status"] in {"blocked", "todo"} and diagnosis["idle_seconds"] >= IDLE_SECONDS:
                 if _receipt(conn, diagnosis, "idle-4h", now):
                     alerts.append(diagnosis)
             outcome = _outcome(conn, row, diagnosis["route"])
@@ -182,7 +187,8 @@ def consume(conn: sqlite3.Connection, *, now: int | None = None, limit: int = BA
                 conn.execute("DELETE FROM blocked_diagnosis_receipts WHERE task_id = ? AND blocked_event_id = ?",
                              (row["task_id"], row["id"]))
             elif diagnosis["status"] in {"archived", "done", "missing"} or conn.execute(
-                "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? AND kind = 'blocked' LIMIT 1",
+                "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? AND kind IN "
+                "('blocked', 'dependency_wait', 'block_loop_detected') LIMIT 1",
                 (row["task_id"], row["id"])).fetchone():
                 conn.execute("DELETE FROM blocked_diagnosis_receipts WHERE task_id = ? AND blocked_event_id = ?",
                              (row["task_id"], row["id"]))
