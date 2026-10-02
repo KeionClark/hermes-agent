@@ -200,3 +200,16 @@ def test_unchanged_gate_never_creates_a_resolver(kanban_home: Path) -> None:
             apply_tick(conn, report)
         assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == before
         assert len(kb.list_comments(conn, root)) == 1
+
+
+def test_controller_receipt_does_not_reset_gate_age_or_duplicate_on_later_ticks(kanban_home: Path) -> None:
+    with kbc.connect() as conn:
+        root = kb.create_task(conn, title="access gate", assignee="chief", priority=100)
+        blocked_at = _block(conn, root)
+        first = controller_tick(conn, now=blocked_at + 25 * 60 * 60)
+        assert apply_tick(conn, first)["alerted_root_task_ids"] == [root]
+        later = controller_tick(conn, now=blocked_at + 50 * 60 * 60)
+        assert later["ledger"][0]["last_check_at"] == blocked_at
+        assert any(item["kind"] == "stale_gate" for item in later["escalations"])
+        assert apply_tick(conn, later)["alerted_root_task_ids"] == []
+        assert len(kb.list_comments(conn, root)) == 1

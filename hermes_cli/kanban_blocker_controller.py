@@ -71,7 +71,12 @@ def _gate_activity(conn: sqlite3.Connection, task_id: str) -> tuple[int, str]:
     latest_block = next((row for row in reversed(events) if row["kind"] == "blocked"), None)
     blocked_at = int(latest_block["created_at"]) if latest_block is not None else 0
     reason = _event_payload(latest_block).get("reason") if latest_block is not None else None
-    activity = max([blocked_at, *(int(row["created_at"]) for row in events if int(row["created_at"]) >= blocked_at)])
+    activity = max([
+        blocked_at,
+        *(int(row["created_at"]) for row in events
+          if int(row["created_at"]) >= blocked_at
+          and not (row["kind"] == "commented" and _event_payload(row).get("author") == "blocker-controller")),
+    ])
     return activity, str(reason or "no explicit block reason recorded")
 
 
@@ -287,7 +292,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Read-only Kanban blocker controller tick")
     parser.add_argument("--json", action="store_true", help="Emit JSON (the scheduler/notifier integration format)")
     parser.add_argument("--now", type=int, help="Epoch time for deterministic replay")
-    parser.add_argument("--apply", action="store_true", help="Create at most one idempotent root resolver and targeted Ready alerts")
+    parser.add_argument("--apply", action="store_true", help="Record deduplicated root gate and Ready alerts on existing cards")
     parser.add_argument("--print-systemd", action="store_true", help="Print reviewed service/timer text without installing it")
     parser.add_argument("--stale-gate-seconds", type=int, default=DEFAULT_STALE_GATE_SECONDS)
     parser.add_argument("--ready-starvation-seconds", type=int, default=DEFAULT_READY_STARVATION_SECONDS)
