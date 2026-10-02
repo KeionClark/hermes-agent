@@ -1537,6 +1537,11 @@ def _enforce_blocked_root_admission(
             "blocked_root_resolver_for must name a blocked needs_input/capability ancestor: "
             + ", ".join(blocked_roots)
         )
+    if resolver_for in parents:
+        raise ValueError(
+            "changed-condition resolver must not depend on its blocked root; "
+            "use creator_task_id for lineage so it can run before resolution"
+        )
     if len(blocked_roots) != 1:
         raise ValueError(
             "changed-condition resolver crosses multiple blocked roots; create one resolver per root: "

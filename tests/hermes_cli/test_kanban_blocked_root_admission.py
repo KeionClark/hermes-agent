@@ -78,21 +78,29 @@ def test_explicit_changed_condition_resolver_is_replay_safe(kanban_home: Path) -
         key = kb.blocked_root_resolver_idempotency_key(root, purpose)
         with pytest.raises(ValueError, match="requires idempotency_key"):
             kb.create_task(
-                conn, title="bad resolver", assignee="worker", parents=[root],
+                conn, title="bad resolver", assignee="worker",
                 creator_task_id=root, created_by="worker", blocked_root_resolver_for=root,
                 blocked_root_resolver_purpose=purpose, idempotency_key="wrong-key",
             )
+        with pytest.raises(ValueError, match="must not depend on its blocked root"):
+            kb.create_task(
+                conn, title="deadlocked resolver", assignee="worker", parents=[root],
+                creator_task_id=root, created_by="worker", blocked_root_resolver_for=root,
+                blocked_root_resolver_purpose=purpose, idempotency_key=key,
+            )
         first = kb.create_task(
-            conn, title="Verify recovered SSH route", assignee="worker", parents=[root],
+            conn, title="Verify recovered SSH route", assignee="worker",
             creator_task_id=root, created_by="worker", blocked_root_resolver_for=root,
             blocked_root_resolver_purpose=purpose, idempotency_key=key,
         )
         second = kb.create_task(
-            conn, title="duplicate retry", assignee="worker", parents=[root],
+            conn, title="duplicate retry", assignee="worker",
             creator_task_id=root, created_by="worker", blocked_root_resolver_for=root,
             blocked_root_resolver_purpose=purpose, idempotency_key=key,
         )
         assert second == first
+        assert kb.get_task(conn, first).status == "ready"
+        assert kb.claim_task(conn, first)
         assert conn.execute("SELECT count(*) FROM tasks WHERE idempotency_key = ?", (key,)).fetchone()[0] == 1
         created = [event for event in kb.list_events(conn, first) if event.kind == "created"]
         assert created[-1].payload["blocked_root_resolver"] == {"root": root, "purpose": purpose}
