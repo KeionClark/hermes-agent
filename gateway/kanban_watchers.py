@@ -100,6 +100,29 @@ class GatewayKanbanWatchersMixin:
             await asyncio.sleep(min(1.0, interval - slept))
             slept += 1.0
 
+    async def _kanban_blocked_diagnosis_watcher(self, board: str) -> None:
+        """Board-scoped <=5s event-ID poll under the dispatcher singleton lock."""
+        from hermes_cli import kanban_db_connect as kbc
+        from hermes_cli.kanban_blocked_diagnosis import consume, migrate
+
+        def tick() -> dict:
+            with kbc.connect_closing(board=board) as conn:
+                migrate(conn)
+                return consume(conn)
+
+        while self._running and self._owns_kanban_dispatcher_lock():
+            try:
+                result = await asyncio.to_thread(tick)
+                if result["diagnoses"] or result["idle_alerts"] or result["outcomes"]:
+                    logger.info("kanban blocked diagnosis board=%s events=%d idle=%d outcomes=%d cursor=%d",
+                                board, len(result["diagnoses"]), len(result["idle_alerts"]),
+                                len(result["outcomes"]), result["cursor"])
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("kanban blocked diagnosis watcher failed on board %s", board)
+            await self._sleep_between_ticks(5.0)
+
     async def _kanban_block_resolution_retention_watcher(self) -> None:
         """Enforce resolution-metadata retention even while dispatch is paused."""
         try:
@@ -324,6 +347,14 @@ class GatewayKanbanWatchersMixin:
         settings = _resolve_dispatcher_settings(kanban_cfg, _kb)
         interval = settings.interval
 
+        # Explicit, approved board slugs only. Unconfigured canonical boards
+        # never migrate or run diagnosis; the 2m controller remains fallback.
+        diagnosis_boards = kanban_cfg.get("blocked_diagnosis_boards", [])
+        if not isinstance(diagnosis_boards, list) or not all(isinstance(slug, str) and slug for slug in diagnosis_boards):
+            diagnosis_boards = []
+        diagnosis_watchers = [asyncio.create_task(self._kanban_blocked_diagnosis_watcher(slug))
+                              for slug in set(diagnosis_boards) if self._owns_kanban_dispatcher_lock()]
+
         # Initial delay so adapters are wired before workers spawn (matches the notifier).
         await asyncio.sleep(5)
 
@@ -376,6 +407,10 @@ class GatewayKanbanWatchersMixin:
                     last_warn_at = now
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
+                for watcher in diagnosis_watchers:
+                    watcher.cancel()
+                if diagnosis_watchers:
+                    await asyncio.gather(*diagnosis_watchers, return_exceptions=True)
                 self._release_kanban_dispatcher_lock()
                 raise
             except Exception:
@@ -383,6 +418,10 @@ class GatewayKanbanWatchersMixin:
 
             await self._sleep_between_ticks(interval)
 
+        for watcher in diagnosis_watchers:
+            watcher.cancel()
+        if diagnosis_watchers:
+            await asyncio.gather(*diagnosis_watchers, return_exceptions=True)
         self._release_kanban_dispatcher_lock()
 
 
