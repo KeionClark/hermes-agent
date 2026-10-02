@@ -306,6 +306,8 @@ _SPECS = [
     ], help="Mark one or more tasks done"),
     _cmd("edit", [
         _TASK_ID,
+        _arg("--fresh-process-opt-in", action="store_true",
+             help="Enable dark local-only fresh-process checkpoints while this card is not running"),
         _arg("--title", help="Replace the task title"),
         _arg("--body", help="Replace the task body"),
         _arg("--priority", type=int, help="Replace the task priority"),

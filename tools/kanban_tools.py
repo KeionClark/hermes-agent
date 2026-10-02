@@ -828,6 +828,7 @@ def _handle_checkpoint(args: dict, **kw) -> str:
             ok = kb.stage_fresh_process_checkpoint(
                 conn, tid, handoff=handoff, delay_seconds=delay,
                 expected_run_id=_worker_run_id(tid), workspace=workspace,
+                board=args.get("board"),
             )
             _check(ok, "could not stage fresh-process checkpoint (run, lease, worker PID, or workspace proof missing)")
             return _ok_landed(kb, conn, tid, "running", fresh_process_checkpoint_staged=True)

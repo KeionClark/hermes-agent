@@ -2270,6 +2270,13 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone()
     if row and row["kind"] == "blocked":
         return True
+    hold = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'fresh_process_checkpoint_rejected' "
+        "AND id > COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'unblocked'), 0) "
+        "LIMIT 1", (task_id, task_id),
+    ).fetchone()
+    if hold:
+        return True
     trip = conn.execute(
         "SELECT payload FROM task_events "
         "WHERE task_id = ? AND kind = 'gave_up' AND id > COALESCE("
@@ -2646,6 +2653,8 @@ def release_stale_claims(
         "  AND claim_expires < ?", (now,),
     ).fetchall()
     for row in stale:
+        if has_pending_fresh_process_checkpoint(conn, row["id"]):
+            continue
         host_local = (row["claim_lock"] or "").startswith(host_prefix)
         hb = row["last_heartbeat_at"]
         # Backstop: a heartbeat older than the max-stale threshold means no
@@ -2674,9 +2683,10 @@ def release_stale_claims(
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ? "
+                "AND NOT EXISTS (SELECT 1 FROM fresh_process_checkpoints WHERE task_id = ?) "
                 # A worker that registered its own pid since the SELECT keeps its claim.
                 "AND worker_pid IS ?",
-                (retry_status, row["id"], row["claim_lock"], now, row["worker_pid"]),
+                (retry_status, row["id"], row["claim_lock"], now, row["id"], row["worker_pid"]),
             )
             if cur.rowcount != 1:
                 continue
@@ -4359,29 +4369,63 @@ def _checkpoint_task_locked(
 
 
 def workspace_fingerprint(workspace: str) -> Optional[str]:
-    """Stable, read-only Git workspace identity; ``None`` is not proof."""
+    """Hash HEAD, index and every visible worktree byte; unreadable is no proof."""
     path = Path(workspace)
     if not path.is_absolute() or not path.is_dir():
         return None
     try:
-        result = subprocess.run(
-            ["git", "-C", str(path), "status", "--porcelain=v1", "-z"],
-            capture_output=True, timeout=10, check=False,
-        )
-        head = subprocess.run(
-            ["git", "-C", str(path), "rev-parse", "HEAD"],
-            capture_output=True, timeout=10, check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
+        def git(*args: str) -> bytes:
+            result = subprocess.run(["git", "-C", str(path), *args], capture_output=True, timeout=10)
+            if result.returncode:
+                raise OSError(result.stderr.decode("utf-8", "replace"))
+            return result.stdout
+
+        root = Path(os.fsdecode(git("rev-parse", "--show-toplevel").strip()))
+        if root.resolve() != path.resolve():
+            return None
+        digest = hashlib.sha256()
+        digest.update(git("rev-parse", "HEAD"))
+        digest.update(git("ls-files", "--stage", "-z"))
+        names = git("ls-files", "--cached", "--others", "-z").split(b"\0")
+        for name in sorted(set(names) - {b""}):
+            target = path / os.fsdecode(name)
+            digest.update(name + b"\0")
+            if target.is_symlink():
+                digest.update(b"link\0" + os.fsencode(os.readlink(target)))
+            elif target.is_file():
+                digest.update(b"file\0")
+                with target.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+            elif target.exists():
+                return None
+            else:
+                digest.update(b"missing\0")
+        return digest.hexdigest()
+    except (OSError, subprocess.TimeoutExpired, ValueError, RuntimeError):
         return None
-    if result.returncode or head.returncode:
-        return None
-    return hashlib.sha256(head.stdout.strip() + b"\0" + result.stdout).hexdigest()
+
+
+def opt_in_fresh_process_checkpoint(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Dark card opt-in, recorded only while its local Git workspace is idle."""
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return False
+    with write_txn(conn):
+        row = conn.execute("SELECT status, workspace_kind, workspace_path FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if (row is None or row["status"] == "running" or row["workspace_kind"] not in ("dir", "worktree")
+                or not row["workspace_path"] or workspace_fingerprint(row["workspace_path"]) is None):
+            return False
+        _append_event(conn, task_id, "fresh_process_checkpoint_opt_in", {"workspace": row["workspace_path"]})
+        return True
+
+
+def has_pending_fresh_process_checkpoint(conn: sqlite3.Connection, task_id: str) -> bool:
+    return conn.execute("SELECT 1 FROM fresh_process_checkpoints WHERE task_id = ?", (task_id,)).fetchone() is not None
 
 
 def stage_fresh_process_checkpoint(
     conn: sqlite3.Connection, task_id: str, *, handoff: dict, delay_seconds: int,
-    expected_run_id: Optional[int], workspace: str,
+    expected_run_id: Optional[int], workspace: str, board: Optional[str] = None,
 ) -> bool:
     """Record a dark, zero-external-action handoff without ending its run."""
     if expected_run_id is None:
@@ -4391,20 +4435,41 @@ def stage_fresh_process_checkpoint(
     actions = handoff.get("external_actions") if isinstance(handoff, dict) else None
     if (not isinstance(handoff, dict) or set(handoff) != {"summary", "next_step", "external_actions"} or
             not isinstance(summary, str) or not summary.strip() or
-            not isinstance(next_step, str) or not next_step.strip() or actions != []):
+            not isinstance(next_step, str) or not next_step.strip() or actions != [] or
+            len(json.dumps(handoff, ensure_ascii=False).encode("utf-8")) > 4096):
         raise ValueError("fresh-process handoff requires summary, next_step, and external_actions: []")
     delay = int(delay_seconds)
     if delay < 1 or delay > MAX_CONTINUATION_DELAY_SECONDS:
         raise ValueError(f"checkpoint delay must be between 1 and {MAX_CONTINUATION_DELAY_SECONDS} seconds")
+    worker_task = os.environ.get("HERMES_KANBAN_TASK")
+    if worker_task and (worker_task != task_id or os.environ.get("HERMES_KANBAN_RUN_ID") != str(expected_run_id)
+                        or os.environ.get("HERMES_KANBAN_WORKSPACE") != workspace
+                        or (board is not None and _normalize_board_slug(board) != get_current_board())):
+        return False
+    db_file = next((entry[2] for entry in conn.execute("PRAGMA database_list") if entry[1] == "main"), "")
+    if not db_file or Path(db_file).resolve() != kanban_db_path(board).resolve():
+        return False
     fingerprint = workspace_fingerprint(workspace)
     if fingerprint is None:
         return False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, current_run_id, claim_lock, claim_expires, worker_pid FROM tasks WHERE id = ?", (task_id,),
+            "SELECT status, current_run_id, claim_lock, claim_expires, worker_pid, workspace_path, workspace_kind "
+            "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
+        opted = conn.execute("SELECT payload FROM task_events WHERE task_id = ? "
+                             "AND kind = 'fresh_process_checkpoint_opt_in' ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+        run = conn.execute("SELECT task_id, status, claim_lock, worker_pid, ended_at "
+                           "FROM task_runs WHERE id = ?", (int(expected_run_id),)).fetchone()
         if (row is None or row["status"] != "running" or row["current_run_id"] != int(expected_run_id)
-                or not row["claim_lock"] or row["claim_expires"] is None or row["worker_pid"] is None):
+                or not (row["claim_lock"] or "").startswith(_host_prefix())
+                or row["claim_expires"] is None or int(row["claim_expires"]) < int(time.time())
+                or row["worker_pid"] is None or int(row["worker_pid"]) <= 0
+                or row["workspace_kind"] not in ("dir", "worktree") or row["workspace_path"] != workspace
+                or opted is None or _json_dict(opted["payload"]).get("workspace") != workspace
+                or run is None or run["task_id"] != task_id or run["status"] != "running"
+                or run["ended_at"] is not None or run["claim_lock"] != row["claim_lock"]
+                or run["worker_pid"] != row["worker_pid"]):
             return False
         conn.execute(
             "INSERT INTO fresh_process_checkpoints "
@@ -4468,8 +4533,9 @@ def reject_fresh_process_checkpoint_locked(
         return
     conn.execute(
         "UPDATE tasks SET status = 'blocked', claim_lock = NULL, claim_expires = NULL, "
-        "worker_pid = NULL, worker_started_at = NULL WHERE id = ? AND current_run_id = ?",
-        (task_id, run_id),
+        "worker_pid = NULL, worker_started_at = NULL, block_kind = 'needs_input', "
+        "last_failure_error = ? WHERE id = ? AND current_run_id = ?",
+        (reason[:500], task_id, run_id),
     )
     closed = _end_run(conn, task_id, outcome="fresh_process_checkpoint_rejected", status="blocked", error=reason)
     conn.execute("DELETE FROM fresh_process_checkpoints WHERE task_id = ? AND run_id = ?", (task_id, run_id))
@@ -4525,11 +4591,12 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     now = int(time.time())
     lines: list[str] = []
     _ctx_header(lines, task)
-    fresh = conn.execute(
-        "SELECT metadata FROM task_runs WHERE task_id = ? AND outcome = 'checkpointed' "
-        "AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 1", (task_id,),
+    previous = conn.execute(
+        "SELECT metadata, outcome FROM task_runs WHERE task_id = ? AND id < ? "
+        "ORDER BY id DESC LIMIT 1", (task_id, task.current_run_id or 0),
     ).fetchone()
-    handoff = _json_dict(fresh["metadata"] if fresh else None).get("fresh_process_handoff")
+    handoff = (_json_dict(previous["metadata"]).get("fresh_process_handoff")
+               if previous and previous["outcome"] == "checkpointed" else None)
     if isinstance(handoff, dict) and handoff.get("external_actions") == []:
         summary, next_step = handoff.get("summary"), handoff.get("next_step")
         if isinstance(summary, str) and isinstance(next_step, str):

@@ -955,6 +955,13 @@ def _cmd_complete(args: argparse.Namespace) -> int:
 
 
 def _cmd_edit(args: argparse.Namespace) -> int:
+    if getattr(args, "fresh_process_opt_in", False):
+        if any(getattr(args, name, None) is not None for name in
+               ("title", "body", "priority", "result", "summary", "metadata")):
+            return _err("kanban edit: --fresh-process-opt-in must be used alone", 2)
+        with kbc.connect_closing() as conn:
+            ok = kb.opt_in_fresh_process_checkpoint(conn, args.task_id)
+        return _ok_or_err(ok, "card must be stopped with a local Git workspace", f"Opted in {args.task_id}")
     result = getattr(args, "result", None)
     raw_metadata = getattr(args, "metadata", None)
     summary = getattr(args, "summary", None)
@@ -1046,6 +1053,7 @@ def _cmd_checkpoint(args: argparse.Namespace) -> int:
                 conn, args.task_id, handoff=handoff, delay_seconds=args.delay_seconds,
                 expected_run_id=_worker_run_id_for(args.task_id),
                 workspace=os.environ.get("HERMES_KANBAN_WORKSPACE", ""),
+                board=kb.get_current_board(),
             )
             if not ok:
                 return _err(f"cannot stage fresh-process checkpoint for {args.task_id} (requires active exact run and Git workspace proof)")

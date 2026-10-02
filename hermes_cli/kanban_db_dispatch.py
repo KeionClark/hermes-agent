@@ -265,11 +265,12 @@ def _exit_code_kind(code: int) -> "tuple[str, int]":
 
 
 _EXIT_TRAILER_RE = re.compile(
-    r"^" + re.escape(KANBAN_WORKER_EXIT_TRAILER) + r"(\d+)\s*$", re.MULTILINE,
+    r"^" + re.escape(KANBAN_WORKER_EXIT_TRAILER) + r"(\d+)(?: run=(\d+))?[ \t]*$", re.MULTILINE,
 )
 
 
-def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional[int]:
+def _worker_log_exit_code(task_id: str, board: Optional[str] = None,
+                          expected_run_id: Optional[int] = None) -> Optional[int]:
     """Exit code from the trailer the worker CLI wrote to its own log; None when absent.
 
     The durable twin of ``_recent_worker_exits``: written by the worker itself
@@ -282,7 +283,12 @@ def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional
     except Exception:
         return None
     matches = _EXIT_TRAILER_RE.findall(raw or "")
-    return int(matches[-1]) if matches else None
+    if not matches:
+        return None
+    code, run_id = matches[-1]
+    if expected_run_id is not None and run_id != str(expected_run_id):
+        return None
+    return int(code)
 
 
 def reap_worker_zombies() -> "list[int]":
@@ -678,6 +684,8 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         lock = row["claim_lock"] or ""
         if not lock.startswith(host_prefix):
             continue
+        if _kb.has_pending_fresh_process_checkpoint(conn, row["id"]):
+            continue
         # Runtime is per attempt: ``tasks.started_at`` records the FIRST start,
         # so retries must be measured from the active task_runs row.
         elapsed = now - int(row["active_started_at"])
@@ -715,8 +723,9 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, tid, pid, row["claim_lock"]),
+                "  AND worker_pid = ? AND claim_lock IS ? "
+                "AND NOT EXISTS (SELECT 1 FROM fresh_process_checkpoints WHERE task_id = ?)",
+                (retry_status, tid, pid, row["claim_lock"], tid),
             )
             if cur.rowcount == 1:
                 payload = {
@@ -786,6 +795,8 @@ def detect_stale_running(
     for row in rows:
         if row["active_started_at"] is None:
             continue
+        if _kb.has_pending_fresh_process_checkpoint(conn, row["id"]):
+            continue
         elapsed = now - int(row["active_started_at"])
         if elapsed < stale_timeout_seconds:
             continue
@@ -818,8 +829,9 @@ def detect_stale_running(
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND claim_lock IS ?",
-                (retry_status, tid, row["claim_lock"]),
+                "  AND claim_lock IS ? "
+                "AND NOT EXISTS (SELECT 1 FROM fresh_process_checkpoints WHERE task_id = ?)",
+                (retry_status, tid, row["claim_lock"], tid),
             )
             if cur.rowcount != 1:
                 continue
@@ -870,6 +882,8 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
     ).fetchall()
     for row in rows:
         tid = row["id"]
+        if _kb.has_pending_fresh_process_checkpoint(conn, tid):
+            continue
         pid = row["worker_pid"]
         if pid and _worker_alive(pid, _kb._row_get(row, "worker_started_at")):
             # Never requeue beside a live process. Retry next tick.
@@ -884,8 +898,9 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND claim_lock IS ? AND claim_expires IS ?",
-                (tid, row["claim_lock"], row["claim_expires"]),
+                "  AND claim_lock IS ? AND claim_expires IS ? "
+                "AND NOT EXISTS (SELECT 1 FROM fresh_process_checkpoints WHERE task_id = ?)",
+                (tid, row["claim_lock"], row["claim_expires"], tid),
             )
             if cur.rowcount != 1:
                 continue
@@ -1173,7 +1188,10 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             ).fetchone()
             if pending is not None:
                 pending_run_id = int(pending["run_id"])
-                if dead.kind == "clean_exit":
+                # The append-only task log can contain an earlier run's clean trailer.
+                # A pending handoff needs a trailer from this exact run.
+                if (dead.kind == "clean_exit" and
+                        _worker_log_exit_code(row["id"], board=board, expected_run_id=pending_run_id) == 0):
                     settled, _exhausted, reason = _kb.settle_fresh_process_checkpoint_locked(
                         conn, row["id"], run_id=pending_run_id, pid=pid,
                     )
@@ -1187,7 +1205,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                     continue
                 _kb.reject_fresh_process_checkpoint_locked(
                     conn, row["id"], run_id=pending_run_id,
-                    reason=f"worker did not exit cleanly ({dead.kind})",
+                    reason=f"worker did not prove clean exit for run {pending_run_id} ({dead.kind})",
                 )
                 continue
             retry_status = _kb._retry_status_for_run(conn, row["id"])
@@ -2320,11 +2338,23 @@ def _run_reclaim_phase(
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
     reap_worker_zombies()
     result.reaped_terminal_workers = reap_terminal_workers(conn)
+    # Settle or hold staged handoffs before any ordinary reclaim can requeue them.
+    with _kb.write_txn(conn):
+        pending = conn.execute(
+            "SELECT p.task_id, p.run_id FROM fresh_process_checkpoints p "
+            "LEFT JOIN tasks t ON t.id = p.task_id "
+            "WHERE t.status = 'running' AND t.current_run_id = p.run_id "
+            "AND (t.claim_lock IS NULL OR t.worker_pid IS NULL)"
+        ).fetchall()
+        for row in pending:
+            _kb.reject_fresh_process_checkpoint_locked(
+                conn, row["task_id"], run_id=int(row["run_id"]), reason="pending handoff lost claim or PID",
+            )
+    result.crashed = detect_crashed_workers(conn, board=board)
     result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
-    result.crashed = detect_crashed_workers(conn, board=board)
     # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))

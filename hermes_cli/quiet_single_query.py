@@ -36,7 +36,11 @@ def exit_single_query(code: int) -> None:
         with contextlib.suppress(Exception):
             # stderr: stdout may be the ``--stream-json`` record stream, and the worker log
             # captures both streams.
-            print(f"\n{KANBAN_WORKER_EXIT_TRAILER}{int(code)}", file=sys.stderr, flush=True)
+            run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "")
+            if run_id.isdecimal():
+                print(f"\n{KANBAN_WORKER_EXIT_TRAILER}{int(code)} run={run_id}", file=sys.stderr, flush=True)
+            else:
+                print(f"\n{KANBAN_WORKER_EXIT_TRAILER}{int(code)}", file=sys.stderr, flush=True)
     sys.exit(code)
 
 
