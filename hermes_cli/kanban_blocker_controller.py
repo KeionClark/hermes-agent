@@ -18,6 +18,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 
 ROOT_BLOCK_KINDS = ("needs_input", "capability")
+CONTROLLER_AUTHOR = "blocker-controller"
 DEFAULT_STALE_GATE_SECONDS = 24 * 60 * 60
 DEFAULT_READY_STARVATION_SECONDS = 60 * 60
 
@@ -75,7 +76,7 @@ def _gate_activity(conn: sqlite3.Connection, task_id: str) -> tuple[int, str]:
         blocked_at,
         *(int(row["created_at"]) for row in events
           if int(row["created_at"]) >= blocked_at
-          and not (row["kind"] == "commented" and _event_payload(row).get("author") == "blocker-controller")),
+          and not (row["kind"] == "commented" and _event_payload(row).get("author") == CONTROLLER_AUTHOR)),
     ])
     return activity, str(reason or "no explicit block reason recorded")
 
@@ -201,8 +202,7 @@ def _workspace_capability(conn: sqlite3.Connection, root_id: str) -> bool:
     return any(token in lowered for token in ("workspace", "checkout", "no such file", "route", "repository"))
 
 
-def apply_tick(conn: sqlite3.Connection, report: dict[str, Any], *, author: str = "blocker-controller",
-               max_resolvers: int = 1) -> dict[str, Any]:
+def apply_tick(conn: sqlite3.Connection, report: dict[str, Any], *, max_resolvers: int = 1) -> dict[str, Any]:
     """Leave bounded, deduplicated wake-up receipts on existing cards."""
     due: dict[str, dict[str, Any]] = {}
     ready: list[dict[str, Any]] = []
@@ -240,7 +240,7 @@ def apply_tick(conn: sqlite3.Connection, report: dict[str, Any], *, author: str 
             if any(marker in comment.body for comment in kb.list_comments(conn, root_id)):
                 continue
             kb.add_comment(
-                conn, root_id, author,
+                conn, root_id, CONTROLLER_AUTHOR,
                 f"{marker} Gate recheck due for @{root.assignee}. Read this card's current evidence "
                 "and verify the exact changed condition before updating the block. "
                 "The recorded blocked-event reason may be stale; do not create another task "
@@ -252,7 +252,7 @@ def apply_tick(conn: sqlite3.Connection, report: dict[str, Any], *, author: str 
             marker = f"[blocker-controller:{escalation['escalation_key']}]"
             if any(marker in comment.body for comment in kb.list_comments(conn, task_id)):
                 continue
-            kb.add_comment(conn, task_id, author,
+            kb.add_comment(conn, task_id, CONTROLLER_AUTHOR,
                            f"{marker} Ready starvation recorded for @{escalation.get('owner') or 'unassigned'}. "
                            "Targeted action: inspect this card's dispatcher/profile capacity; no unrelated card was dispatched.")
             commented_ready_ids.append(task_id)
