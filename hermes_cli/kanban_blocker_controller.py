@@ -187,22 +187,6 @@ def _condition_revision(conn: sqlite3.Connection, root_id: str) -> str:
     return "initial"
 
 
-def _active_resolver_id(conn: sqlite3.Connection, root_id: str) -> Optional[str]:
-    """Return an unfinished resolver linked to this root by its durable create event."""
-    for event in conn.execute("SELECT task_id, payload FROM task_events WHERE kind = 'created' ORDER BY id DESC"):
-        resolver = _event_payload(event).get("blocked_root_resolver")
-        if not isinstance(resolver, dict) or resolver.get("root") != root_id:
-            continue
-        task = kb.get_task(conn, event["task_id"])
-        if task is not None and task.status not in {"done", "archived"}:
-            return task.id
-    return None
-
-
-def _resolver_purpose(conn: sqlite3.Connection, root_id: str, reason: str) -> str:
-    return "verify changed condition " + _condition_revision(conn, root_id) + ": " + " ".join(reason.split())[:90]
-
-
 def _workspace_capability(conn: sqlite3.Connection, root_id: str) -> bool:
     row = conn.execute("SELECT last_failure_error FROM tasks WHERE id = ?", (root_id,)).fetchone()
     text = str(row["last_failure_error"] or "") if row else ""
@@ -214,12 +198,7 @@ def _workspace_capability(conn: sqlite3.Connection, root_id: str) -> bool:
 
 def apply_tick(conn: sqlite3.Connection, report: dict[str, Any], *, author: str = "blocker-controller",
                max_resolvers: int = 1) -> dict[str, Any]:
-    """Perform one bounded wake-up: one resolver and targeted Ready alerts.
-
-    A resolver is a runnable, idempotent task under the exact blocked-root
-    admission contract. It carries lineage only, never a blocking parent edge.
-    No elapsed time path unblocks a card or recreates a downstream graph.
-    """
+    """Leave bounded, deduplicated wake-up receipts on existing cards."""
     due: dict[str, dict[str, Any]] = {}
     ready: list[dict[str, Any]] = []
     for escalation in report.get("escalations", []):
@@ -230,7 +209,7 @@ def apply_tick(conn: sqlite3.Connection, report: dict[str, Any], *, author: str 
             if root_id not in due or escalation["kind"] == "stale_gate":
                 due[root_id] = escalation
 
-    resolver_ids: list[str] = []
+    alerted_root_ids: list[str] = []
     commented_ready_ids: list[str] = []
     ordered = sorted(
         due.values(),
@@ -241,36 +220,28 @@ def apply_tick(conn: sqlite3.Connection, report: dict[str, Any], *, author: str 
             item["root_gate_id"],
         ),
     )
-    for escalation in ordered[:max_resolvers]:
-        root_id = escalation["root_gate_id"]
-        root = kb.get_task(conn, root_id)
-        if root is None or not root.assignee:
-            continue
-        reason = str(escalation.get("reason") or "no explicit block reason recorded")
-        if root.block_kind not in ROOT_BLOCK_KINDS:
-            if not _workspace_capability(conn, root_id):
-                continue
-            kb.block_task(conn, root_id, reason="capability: verify workspace/repository route", kind="capability")
-            root = kb.get_task(conn, root_id)
-        if _active_resolver_id(conn, root_id) is not None:
-            continue
-        purpose = _resolver_purpose(conn, root_id, reason)
-        key = kb.blocked_root_resolver_idempotency_key(root_id, purpose)
-        existing = conn.execute("SELECT id, status FROM tasks WHERE idempotency_key = ?", (key,)).fetchone()
-        if existing is not None and existing["status"] in {"done", "archived"}:
-            continue
-        resolver_ids.append(kb.create_task(
-            conn, title=f"Resolve gate: {root.title}",
-            body=("Verify this specific changed condition before resolving the root: " + reason
-                  + f"\n\nBefore completing, @{root.assignee} must post `[changed-condition] <specific evidence>` "
-                    f"on root {root_id}. Without that owner receipt, this gate cannot retry."),
-            assignee=root.assignee, priority=max(90, int(escalation.get("effective_priority") or 0)),
-            created_by=author, creator_task_id=root_id,
-            blocked_root_resolver_for=root_id, blocked_root_resolver_purpose=purpose,
-            idempotency_key=key,
-        ))
-
     with kb.write_txn(conn):
+        for escalation in ordered:
+            if len(alerted_root_ids) >= max_resolvers:
+                break
+            root_id = escalation["root_gate_id"]
+            root = kb.get_task(conn, root_id)
+            if root is None or not root.assignee:
+                continue
+            if root.block_kind not in ROOT_BLOCK_KINDS and not _workspace_capability(conn, root_id):
+                continue
+            revision = _condition_revision(conn, root_id)
+            marker = f"[blocker-controller:{escalation['escalation_key']}:{revision}]"
+            if any(marker in comment.body for comment in kb.list_comments(conn, root_id)):
+                continue
+            kb.add_comment(
+                conn, root_id, author,
+                f"{marker} Gate recheck due for @{root.assignee}. Read this card's current evidence "
+                "and verify the exact changed condition before updating the block. "
+                "The recorded blocked-event reason may be stale; do not create another task "
+                "or clear a live witness without proof."
+            )
+            alerted_root_ids.append(root_id)
         for escalation in ready:
             task_id = escalation["task_id"]
             marker = f"[blocker-controller:{escalation['escalation_key']}]"
@@ -280,7 +251,7 @@ def apply_tick(conn: sqlite3.Connection, report: dict[str, Any], *, author: str 
                            f"{marker} Ready starvation recorded for @{escalation.get('owner') or 'unassigned'}. "
                            "Targeted action: inspect this card's dispatcher/profile capacity; no unrelated card was dispatched.")
             commented_ready_ids.append(task_id)
-    return {"resolver_task_ids": resolver_ids, "ready_alert_task_ids": commented_ready_ids}
+    return {"alerted_root_task_ids": alerted_root_ids, "ready_alert_task_ids": commented_ready_ids}
 
 
 def systemd_units() -> dict[str, str]:

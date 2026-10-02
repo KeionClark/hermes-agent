@@ -79,33 +79,22 @@ def test_recent_gate_does_not_escalate_and_intervals_must_be_positive(kanban_hom
             controller_tick(conn, now=blocked_at, stale_gate_seconds=0)
 
 
-def test_apply_creates_one_runnable_resolver_and_targets_ready_alert(kanban_home: Path) -> None:
+def test_apply_alerts_original_root_without_creating_task(kanban_home: Path) -> None:
     with kbc.connect() as conn:
         root = kb.create_task(conn, title="access gate", assignee="chief", priority=100)
         blocked_at = _block(conn, root)
         ready = kb.create_task(conn, title="unclaimed urgent", assignee="release", priority=95)
-        report = controller_tick(
-            conn, now=blocked_at + 25 * 60 * 60,
-            stale_gate_seconds=24 * 60 * 60, ready_starvation_seconds=60 * 60,
-        )
-        first = apply_tick(conn, report)
-        event_count = conn.execute("SELECT count(*) FROM task_events").fetchone()[0]
+        report = controller_tick(conn, now=blocked_at + 25 * 60 * 60)
         task_count = conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
+        first = apply_tick(conn, report)
         second = apply_tick(conn, report)
-
-        assert len(first["resolver_task_ids"]) == 1
-        resolver = kb.get_task(conn, first["resolver_task_ids"][0])
-        assert resolver.status == "ready"
-        assert resolver.assignee == "chief"
-        assert "@chief must post `[changed-condition] <specific evidence>`" in resolver.body
-        assert first["ready_alert_task_ids"] == [ready]
-        assert second["resolver_task_ids"] == []
-        assert second["ready_alert_task_ids"] == []
-        assert conn.execute("SELECT count(*) FROM task_events").fetchone()[0] == event_count
+        assert first == {"alerted_root_task_ids": [root], "ready_alert_task_ids": [ready]}
+        assert second == {"alerted_root_task_ids": [], "ready_alert_task_ids": []}
         assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == task_count
         assert kb.get_task(conn, root).status == "blocked"
+        assert len(kb.list_comments(conn, root)) == 1
+        assert "may be stale" in kb.list_comments(conn, root)[0].body
         assert len(kb.list_comments(conn, ready)) == 1
-
 
 def test_outer_gate_and_descendant_priority_win(kanban_home: Path) -> None:
     with kbc.connect() as conn:
@@ -119,8 +108,7 @@ def test_outer_gate_and_descendant_priority_win(kanban_home: Path) -> None:
         assert entry["root_gate_id"] == outer
         assert entry["effective_priority"] == 100
         applied = apply_tick(conn, report)
-        resolver = kb.get_task(conn, applied["resolver_task_ids"][0])
-        assert resolver.title == "Resolve gate: outer"
+        assert applied["alerted_root_task_ids"] == [outer]
 
 
 def test_diamond_graph_is_cycle_safe_and_groups_at_outer_gate(kanban_home: Path) -> None:
@@ -140,7 +128,7 @@ def test_diamond_graph_is_cycle_safe_and_groups_at_outer_gate(kanban_home: Path)
 
 
 
-def test_merged_blocked_roots_choose_one_resolver_scope(kanban_home: Path) -> None:
+def test_merged_blocked_roots_choose_one_alert_scope(kanban_home: Path) -> None:
     with kbc.connect() as conn:
         left = kb.create_task(conn, title="left root", assignee="left", priority=90)
         right = kb.create_task(conn, title="right root", assignee="right", priority=90)
@@ -153,10 +141,7 @@ def test_merged_blocked_roots_choose_one_resolver_scope(kanban_home: Path) -> No
         entry = next(item for item in report["ledger"] if leaf in item["blocked_task_ids"])
         assert entry["root_gate_id"] == min(left, right)
         applied = apply_tick(conn, report)
-        assert len(applied["resolver_task_ids"]) == 1
-        resolver = kb.get_task(conn, applied["resolver_task_ids"][0])
-        assert resolver.title == f"Resolve gate: {kb.get_task(conn, min(left, right)).title}"
-        assert resolver.status == "ready"
+        assert applied["alerted_root_task_ids"] == [min(left, right)]
 
 
 def test_systemd_text_is_bounded_and_not_installed(kanban_home: Path) -> None:
@@ -167,39 +152,32 @@ def test_systemd_text_is_bounded_and_not_installed(kanban_home: Path) -> None:
     assert "hermes --run-module hermes_cli.kanban_blocker_controller --apply --json" in units["service"]
 
 
-def test_workspace_crash_root_is_classified_before_one_resolver(kanban_home: Path) -> None:
+def test_workspace_crash_alerts_original_without_reclassifying(kanban_home: Path) -> None:
     with kbc.connect() as conn:
         root = kb.create_task(conn, title="missing checkout", assignee="release", initial_status="blocked")
         conn.execute("UPDATE tasks SET last_failure_error = ? WHERE id = ?", ("workspace checkout route missing", root))
         conn.commit()
         blocked_at = max(event.created_at for event in kb.list_events(conn, root) if event.kind == "blocked")
         report = controller_tick(conn, now=blocked_at + 25 * 60 * 60)
+        task_count = conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
         applied = apply_tick(conn, report)
-        assert kb.get_task(conn, root).block_kind == "capability"
-        assert len(applied["resolver_task_ids"]) == 1
-        assert kb.get_task(conn, applied["resolver_task_ids"][0]).status == "ready"
+        assert applied["alerted_root_task_ids"] == [root]
+        assert kb.get_task(conn, root).status == "blocked"
+        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == task_count
 
-
-def test_terminal_resolver_waits_for_explicit_changed_condition_marker(kanban_home: Path) -> None:
+def test_owner_changed_condition_gets_new_receipt_on_original(kanban_home: Path) -> None:
     with kbc.connect() as conn:
         root = kb.create_task(conn, title="access gate", assignee="chief", priority=100)
         blocked_at = _block(conn, root)
         report = controller_tick(conn, now=blocked_at + 25 * 60 * 60)
-        first = apply_tick(conn, report)
-        resolver_id = first["resolver_task_ids"][0]
-        assert kb.claim_task(conn, resolver_id)
-        assert kb.complete_task(conn, resolver_id, result="condition still unavailable")
-        assert kb.get_task(conn, root).status == "blocked"
-        assert apply_tick(conn, report)["resolver_task_ids"] == []
-
+        assert apply_tick(conn, report)["alerted_root_task_ids"] == [root]
         kb.add_comment(conn, root, "other", "[changed-condition] repository route has been restored")
-        assert apply_tick(conn, report)["resolver_task_ids"] == []
+        assert apply_tick(conn, report)["alerted_root_task_ids"] == []
         kb.add_comment(conn, root, "chief", "[changed-condition] repository route has been restored")
-        changed = apply_tick(conn, report)
-        assert len(changed["resolver_task_ids"]) == 1
-        assert changed["resolver_task_ids"][0] != resolver_id
-        assert kb.get_task(conn, changed["resolver_task_ids"][0]).status == "ready"
-
+        assert apply_tick(conn, report)["alerted_root_task_ids"] == [root]
+        assert apply_tick(conn, report)["alerted_root_task_ids"] == []
+        assert kb.get_task(conn, root).status == "blocked"
+        assert len(kb.list_tasks(conn)) == 1
 
 def test_apply_selects_highest_priority_critical_root_first(kanban_home: Path) -> None:
     with kbc.connect() as conn:
@@ -207,23 +185,18 @@ def test_apply_selects_highest_priority_critical_root_first(kanban_home: Path) -
         high = kb.create_task(conn, title="P100 root", assignee="chief", priority=100)
         low_at, high_at = _block(conn, low), _block(conn, high)
         report = controller_tick(conn, now=max(low_at, high_at) + 25 * 60 * 60)
-        applied = apply_tick(conn, report, max_resolvers=1)
-        resolver = kb.get_task(conn, applied["resolver_task_ids"][0])
-        assert "P100 root" in resolver.title
+        first = apply_tick(conn, report, max_resolvers=1)
+        second = apply_tick(conn, report, max_resolvers=1)
+        assert first["alerted_root_task_ids"] == [high]
+        assert second["alerted_root_task_ids"] == [low]
 
-
-def test_changed_condition_does_not_duplicate_an_active_resolver(kanban_home: Path) -> None:
+def test_unchanged_gate_never_creates_a_resolver(kanban_home: Path) -> None:
     with kbc.connect() as conn:
         root = kb.create_task(conn, title="access gate", assignee="chief", priority=100)
         blocked_at = _block(conn, root)
         report = controller_tick(conn, now=blocked_at + 25 * 60 * 60)
-        first = apply_tick(conn, report)
-        kb.add_comment(conn, root, "chief", "[changed-condition] route changed")
-        assert apply_tick(conn, report)["resolver_task_ids"] == []
-        assert len([task for task in kb.list_tasks(conn) if task.title.startswith("Resolve gate:")]) == 1
-        resolver = first["resolver_task_ids"][0]
-        assert kb.claim_task(conn, resolver)
-        assert kb.complete_task(conn, resolver, result="old verification finished")
-        second = apply_tick(conn, report)
-        assert len(second["resolver_task_ids"]) == 1
-        assert second["resolver_task_ids"][0] != resolver
+        before = conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
+        for _ in range(3):
+            apply_tick(conn, report)
+        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == before
+        assert len(kb.list_comments(conn, root)) == 1
