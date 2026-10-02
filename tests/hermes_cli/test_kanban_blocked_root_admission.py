@@ -6,6 +6,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli.kanban_db_graph import decompose_triage_task
 
 
 @pytest.fixture
@@ -56,6 +57,17 @@ def test_known_automation_identity_cannot_fan_out_below_blocked_root(kanban_home
             kb.create_task(
                 conn, title="automatic child", assignee="worker", parents=[root],
                 created_by="decomposer",
+            )
+
+
+def test_decomposer_cannot_fan_out_a_triage_child_below_blocked_root(kanban_home: Path) -> None:
+    with kbc.connect() as conn:
+        root = _blocked_root(conn)
+        triage = kb.create_task(conn, title="triage child", assignee="worker", parents=[root], triage=True)
+        with pytest.raises(ValueError, match="blocked needs_input/capability ancestor"):
+            decompose_triage_task(
+                conn, triage, root_assignee="worker",
+                children=[{"title": "automatic child", "assignee": "worker"}], author="decomposer",
             )
 
 
