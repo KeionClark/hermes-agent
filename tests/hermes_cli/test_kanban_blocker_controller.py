@@ -139,6 +139,26 @@ def test_diamond_graph_is_cycle_safe_and_groups_at_outer_gate(kanban_home: Path)
         assert entry["effective_priority"] == 100
 
 
+
+def test_merged_blocked_roots_choose_one_resolver_scope(kanban_home: Path) -> None:
+    with kbc.connect() as conn:
+        left = kb.create_task(conn, title="left root", assignee="left", priority=90)
+        right = kb.create_task(conn, title="right root", assignee="right", priority=90)
+        left_at, right_at = _block(conn, left), _block(conn, right)
+        leaf = kb.create_task(
+            conn, title="merged P100 leaf", assignee="builder", parents=[left, right],
+            initial_status="blocked", priority=100,
+        )
+        report = controller_tick(conn, now=max(left_at, right_at) + 61 * 60)
+        entry = next(item for item in report["ledger"] if leaf in item["blocked_task_ids"])
+        assert entry["root_gate_id"] == min(left, right)
+        applied = apply_tick(conn, report)
+        assert len(applied["resolver_task_ids"]) == 1
+        resolver = kb.get_task(conn, applied["resolver_task_ids"][0])
+        assert resolver.title == f"Resolve gate: {kb.get_task(conn, min(left, right)).title}"
+        assert resolver.status == "ready"
+
+
 def test_systemd_text_is_bounded_and_not_installed(kanban_home: Path) -> None:
     from hermes_cli.kanban_blocker_controller import systemd_units
     units = systemd_units()
