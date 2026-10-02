@@ -107,7 +107,7 @@ def test_apply_creates_one_runnable_resolver_and_targets_ready_alert(kanban_home
         assert len(kb.list_comments(conn, ready)) == 1
 
 
-def test_nearest_gate_and_descendant_priority_win(kanban_home: Path) -> None:
+def test_outer_gate_and_descendant_priority_win(kanban_home: Path) -> None:
     with kbc.connect() as conn:
         outer = kb.create_task(conn, title="outer", assignee="chief", priority=10)
         blocked_at = _block(conn, outer)
@@ -116,7 +116,26 @@ def test_nearest_gate_and_descendant_priority_win(kanban_home: Path) -> None:
         child = kb.create_task(conn, title="urgent child", assignee="chief", parents=[inner], initial_status="blocked", priority=100)
         report = controller_tick(conn, now=blocked_at + 61 * 60)
         entry = next(item for item in report["ledger"] if child in item["blocked_task_ids"])
-        assert entry["root_gate_id"] == inner
+        assert entry["root_gate_id"] == outer
+        assert entry["effective_priority"] == 100
+        applied = apply_tick(conn, report)
+        resolver = kb.get_task(conn, applied["resolver_task_ids"][0])
+        assert resolver.title == "Resolve gate: outer"
+
+
+def test_diamond_graph_is_cycle_safe_and_groups_at_outer_gate(kanban_home: Path) -> None:
+    with kbc.connect() as conn:
+        root = kb.create_task(conn, title="root", assignee="chief", priority=10)
+        blocked_at = _block(conn, root)
+        left = kb.create_task(conn, title="left", assignee="builder", parents=[root], initial_status="blocked")
+        right = kb.create_task(conn, title="right", assignee="builder", parents=[root], initial_status="blocked")
+        leaf = kb.create_task(
+            conn, title="P100 diamond leaf", assignee="builder", parents=[left, right],
+            initial_status="blocked", priority=100,
+        )
+        report = controller_tick(conn, now=blocked_at + 61 * 60)
+        entry = next(item for item in report["ledger"] if leaf in item["blocked_task_ids"])
+        assert entry["root_gate_id"] == root
         assert entry["effective_priority"] == 100
 
 
