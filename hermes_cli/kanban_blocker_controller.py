@@ -29,28 +29,40 @@ def _event_payload(row: sqlite3.Row) -> dict[str, Any]:
         return {}
 
 
-def _root_gate(conn: sqlite3.Connection, task_id: str) -> sqlite3.Row:
-    """Return the oldest operator-facing blocked ancestor, or the card itself."""
-    row = conn.execute(
+def _blocked_root_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
+    """Return distinct blocked admission roots reachable through parent links."""
+    rows = conn.execute(
         """
-        WITH RECURSIVE upstream(id, depth) AS (
-            SELECT id, 0 FROM tasks WHERE id = ?
-            UNION ALL
-            SELECT links.parent_id, upstream.depth + 1
-              FROM task_links AS links JOIN upstream ON links.child_id = upstream.id
+        WITH RECURSIVE upstream(id) AS (
+            SELECT id FROM tasks WHERE id = ?
+            UNION
+            SELECT links.parent_id FROM task_links AS links JOIN upstream ON links.child_id = upstream.id
         )
-        SELECT tasks.* FROM tasks JOIN upstream ON upstream.id = tasks.id
+        SELECT tasks.id FROM tasks JOIN upstream ON upstream.id = tasks.id
          WHERE tasks.status = 'blocked' AND tasks.block_kind IN (?, ?)
-         ORDER BY upstream.depth ASC, tasks.id ASC LIMIT 1
+         ORDER BY tasks.id
         """, (task_id, *ROOT_BLOCK_KINDS),
-    ).fetchone()
-    if row is not None:
-        return row
-    fallback = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
-    if fallback is None:
-        raise ValueError(f"unknown task {task_id}")
-    return fallback
+    ).fetchall()
+    return [str(row["id"]) for row in rows]
 
+
+def _root_gate(conn: sqlite3.Connection, task_id: str) -> sqlite3.Row:
+    """Return a deterministic outer blocked ancestor suitable for one resolver.
+
+    ``UNION`` is deliberate: dependency diamonds and historical cycles must not
+    multiply recursive paths. A descendant's priority belongs to the outermost
+    blocked gate, whose creator lineage has only that one admission root.
+    """
+    candidates = _blocked_root_ids(conn, task_id)
+    outer = [
+        root_id for root_id in candidates
+        if not (set(_blocked_root_ids(conn, root_id)) - {root_id})
+    ]
+    selected = min(outer or candidates, default=task_id)
+    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (selected,)).fetchone()
+    if row is None:
+        raise ValueError(f"unknown task {task_id}")
+    return row
 
 def _gate_activity(conn: sqlite3.Connection, task_id: str) -> tuple[int, str]:
     events = conn.execute(
