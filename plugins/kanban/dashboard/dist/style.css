@@ -1609,3 +1609,25 @@
 .hermes-kanban-trash-label {
   font-weight: 500;
 }
+
+
+.hermes-kanban-block-update {
+  border-left: 2px solid var(--color-border, #64748b);
+  padding-left: 0.5rem;
+  min-width: 0;
+}
+.hermes-kanban-block-update-head {
+  font-size: 0.6875rem;
+  color: var(--color-muted-foreground, #94a3b8);
+  margin-bottom: 0.2rem;
+}
+.hermes-kanban-block-update-text {
+  font-size: 0.75rem;
+  line-height: 1.4;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow-wrap: anywhere;
+  color: var(--color-foreground);
+}

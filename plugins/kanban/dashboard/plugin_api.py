@@ -181,9 +181,40 @@ def _activity_preview(activity: Optional[dict[str, Any]]) -> Optional[dict[str, 
     return preview
 
 
+def _latest_block_updates(conn, task_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """Latest substantive comment for blocked cards, excluding controller nudges."""
+    if not task_ids:
+        return {}
+    placeholders = ",".join("?" for _ in task_ids)
+    rows = conn.execute(
+        f"""
+        SELECT c.task_id, c.body AS text, c.author, c.created_at
+          FROM task_comments c
+         WHERE c.task_id IN ({placeholders})
+           AND c.author != 'blocker-controller'
+           AND c.body != ''
+           AND c.id = (
+               SELECT MAX(newer.id) FROM task_comments newer
+                WHERE newer.task_id = c.task_id
+                  AND newer.author != 'blocker-controller'
+                  AND newer.body != ''
+           )
+        """,
+        task_ids,
+    ).fetchall()
+    return {
+        row["task_id"]: {
+            "text": row["text"], "author": row["author"],
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    }
+
+
 def _task_dict(
     task: kanban_db.Task, *, latest_summary: Optional[str] = None,
     latest_activity: Optional[dict[str, Any]] = None,
+    latest_block_update: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     d = asdict(task)
     # Derived age metrics so the UI can colour stale cards without client deltas.
@@ -194,6 +225,7 @@ def _task_dict(
     # Latest non-null run summary (workers hand off via ``task_runs.summary``, not ``tasks.result``).
     d["latest_summary"] = latest_summary
     d["latest_activity"] = _activity_preview(latest_activity)
+    d["latest_block_update"] = latest_block_update
     return d
 
 
@@ -325,11 +357,14 @@ def get_board(
         task_ids = [t.id for t in tasks]
         summary_map = kanban_db.latest_summaries(conn, task_ids)
         activity_map = kanban_db.latest_activity_previews(conn, task_ids)
+        block_update_map = _latest_block_updates(
+            conn, [t.id for t in tasks if t.status == "blocked"])
         for t in tasks:
             full = summary_map.get(t.id)
             d = _task_dict(
                 t, latest_summary=(full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None),
                 latest_activity=activity_map.get(t.id),
+                latest_block_update=_activity_preview(block_update_map.get(t.id)),
             )
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
@@ -391,6 +426,8 @@ def get_task(
         task_d = _task_dict(
             task, latest_summary=kanban_db.latest_summary(conn, task_id),
             latest_activity=kanban_db.latest_activity_previews(conn, [task_id]).get(task_id),
+            latest_block_update=_latest_block_updates(
+                conn, [task_id]).get(task_id) if task.status == "blocked" else None,
         )
         links = _links_for(conn, task_id)
         child_summaries = kanban_db.latest_summaries(conn, links["children"])

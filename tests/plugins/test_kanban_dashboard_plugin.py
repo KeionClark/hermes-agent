@@ -1161,3 +1161,38 @@ def test_touch_card_tap_opens_instead_of_dragging():
 # ---------------------------------------------------------------------------
 # Diagnostic severity colours follow the dashboard theme
 # ---------------------------------------------------------------------------
+
+def test_blocked_card_exposes_latest_substantive_update(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Customer issue", "assignee": "release-engineer"},
+    ).json()["task"]
+    task_id = task["id"]
+    blocked = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"status": "blocked", "block_reason": "Old access failure"},
+    )
+    assert blocked.status_code == 200, blocked.text
+    for author, body in (
+        ("release-engineer", "Current route: test the approved credential."),
+        ("blocker-controller", "Gate check due."),
+    ):
+        response = client.post(
+            f"/api/plugins/kanban/tasks/{task_id}/comments",
+            json={"author": author, "body": body},
+        )
+        assert response.status_code == 200, response.text
+
+    board = client.get("/api/plugins/kanban/board").json()
+    card = next(
+        t for col in board["columns"] if col["name"] == "blocked"
+        for t in col["tasks"] if t["id"] == task_id
+    )
+    update = card["latest_block_update"]
+    assert update["author"] == "release-engineer"
+    assert update["text"] == "Current route: test the approved credential."
+    assert update["created_at"] > 0
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{task_id}").json()
+    assert detail["task"]["latest_block_update"] == update
+    assert "Old access failure" in detail["task"]["latest_summary"]

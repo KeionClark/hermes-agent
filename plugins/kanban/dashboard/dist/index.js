@@ -822,7 +822,7 @@
         if (tenantFilter && t.tenant !== tenantFilter) return false;
         if (assigneeFilter && t.assignee !== assigneeFilter) return false;
         if (q) {
-          const hay = `${t.id} ${t.title || ""} ${t.body || ""} ${t.result || ""} ${t.latest_summary || ""} ${t.assignee || ""} ${t.tenant || ""}`.toLowerCase();
+          const hay = `${t.id} ${t.title || ""} ${t.body || ""} ${t.result || ""} ${t.latest_summary || ""} ${(t.latest_block_update && t.latest_block_update.text) || ""} ${t.assignee || ""} ${t.tenant || ""}`.toLowerCase();
           if (hay.indexOf(q) === -1) return false;
         }
         return true;
@@ -3251,6 +3251,15 @@
           ),
           h("div", { className: "hermes-kanban-card-title" },
             t.title || tx(i18n, "untitled", "(untitled)")),
+          t.status === "blocked" && t.latest_block_update
+            ? h("div", { className: "hermes-kanban-block-update" },
+                h("div", { className: "hermes-kanban-block-update-head" },
+                  tx(i18n, "latestBlockUpdate", "Latest update"),
+                  " · @", t.latest_block_update.author || "unknown",
+                  " · ", timeAgo ? timeAgo(t.latest_block_update.created_at) : ""),
+                h("div", { className: "hermes-kanban-block-update-text" },
+                  t.latest_block_update.text))
+            : null,
           h("div", { className: "hermes-kanban-card-row hermes-kanban-card-meta" },
             t.assignee
               ? h("span", { className: "hermes-kanban-assignee",
@@ -4063,6 +4072,18 @@
         renderMarkdown: props.renderMarkdown,
         onPatch: props.onPatch,
       }),
+      t.status === "blocked" && t.latest_block_update
+        ? h("div", { className: "hermes-kanban-section" },
+            h("div", { className: "hermes-kanban-section-head" },
+              tx(i18n, "latestBlockUpdate", "Latest update"),
+              " · @", t.latest_block_update.author || "unknown",
+              " · ", new Date(t.latest_block_update.created_at * 1000).toLocaleString()),
+            h(MarkdownBlock, {
+              source: t.latest_block_update.text,
+              enabled: props.renderMarkdown,
+            }),
+          )
+        : null,
       h(DependencyEditor, {
         task: t,
         links, allTasks: props.allTasks,
@@ -4078,7 +4099,9 @@
         if (finalResult) {
           var label = t.result
             ? tx(i18n, "result", "Result")
-            : tx(i18n, "finalResult", "Final Result (run summary)");
+            : t.status === "blocked"
+              ? tx(i18n, "previousRunSummary", "Previous run summary")
+              : tx(i18n, "finalResult", "Final Result (run summary)");
           return h("div", { className: "hermes-kanban-section" },
             h("div", { className: "hermes-kanban-section-head" }, label),
             h(MarkdownBlock, { source: finalResult, enabled: props.renderMarkdown }),
