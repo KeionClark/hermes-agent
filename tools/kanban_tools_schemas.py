@@ -212,8 +212,13 @@ KANBAN_CHECKPOINT_SCHEMA = _schema(
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
         "summary": _prop("string", "Concrete checkpoint: revision/evidence completed and the next engineering step."),
         "delay_seconds": _prop("integer", "Delay before the dispatcher resumes the same card (default 60; maximum 3600)."),
+        "fresh_process_handoff": _prop("object", (
+            "Explicit dark-pilot handoff. It must contain exactly summary, next_step, and "
+            "external_actions: []. The run stays claimed until its process exits cleanly; then a fresh "
+            "process receives only the original brief plus this handoff. Any external action is refused."
+        )),
     },
-    ["summary"],
+    [],
 )
 
 KANBAN_REQUEST_REVIEW_SCHEMA = _schema(

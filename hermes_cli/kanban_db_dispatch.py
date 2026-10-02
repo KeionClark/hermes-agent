@@ -1168,6 +1168,28 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
 
             pid = int(row["worker_pid"])
             dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
+            pending = conn.execute(
+                "SELECT run_id FROM fresh_process_checkpoints WHERE task_id = ?", (row["id"],),
+            ).fetchone()
+            if pending is not None:
+                pending_run_id = int(pending["run_id"])
+                if dead.kind == "clean_exit":
+                    settled, _exhausted, reason = _kb.settle_fresh_process_checkpoint_locked(
+                        conn, row["id"], run_id=pending_run_id, pid=pid,
+                    )
+                    if settled:
+                        # ``checkpoint_task`` preserved the canonical fenced event,
+                        # continuation cap, and delayed resume behavior.
+                        continue
+                    _kb.reject_fresh_process_checkpoint_locked(
+                        conn, row["id"], run_id=pending_run_id, reason=reason,
+                    )
+                    continue
+                _kb.reject_fresh_process_checkpoint_locked(
+                    conn, row["id"], run_id=pending_run_id,
+                    reason=f"worker did not exit cleanly ({dead.kind})",
+                )
+                continue
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(

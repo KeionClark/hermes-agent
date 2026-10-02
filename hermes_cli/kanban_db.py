@@ -12,6 +12,7 @@ locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attach
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -1046,6 +1047,20 @@ CREATE TABLE IF NOT EXISTS task_runs (
     summary             TEXT,
     metadata            TEXT,
     error               TEXT
+);
+
+-- A fresh-process checkpoint remains deliberately small.  It exists only
+-- between the worker's handoff and its observed clean exit; the durable
+-- successor handoff is copied to task_runs.metadata when settled.
+CREATE TABLE IF NOT EXISTS fresh_process_checkpoints (
+    task_id               TEXT PRIMARY KEY,
+    run_id                INTEGER NOT NULL UNIQUE,
+    claim_lock            TEXT NOT NULL,
+    worker_pid            INTEGER NOT NULL,
+    workspace_fingerprint TEXT NOT NULL,
+    handoff               TEXT NOT NULL,
+    delay_seconds         INTEGER NOT NULL,
+    created_at            INTEGER NOT NULL
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -4260,7 +4275,7 @@ MAX_CONTINUATION_DELAY_SECONDS = 3600
 def checkpoint_task(
     conn: sqlite3.Connection, task_id: str, *, summary: str,
     delay_seconds: int = DEFAULT_CONTINUATION_DELAY_SECONDS,
-    expected_run_id: Optional[int] = None,
+    expected_run_id: Optional[int] = None, metadata: Optional[dict] = None,
 ) -> tuple[bool, bool]:
     """Close one active run as a bounded, delayed engineering continuation.
 
@@ -4281,57 +4296,185 @@ def checkpoint_task(
             f"checkpoint delay must be between 1 and {MAX_CONTINUATION_DELAY_SECONDS} seconds")
     if expected_run_id is None:
         return False, False
-    now = int(time.time())
     with write_txn(conn):
-        row = conn.execute(
-            "SELECT status, current_run_id, continuation_count, block_kind, block_recurrences "
-            "FROM tasks WHERE id = ?", (task_id,),
-        ).fetchone()
-        if row is None or row["status"] != "running" or row["current_run_id"] != int(expected_run_id):
-            return False, False
-        attempt = int(_row_get(row, "continuation_count") or 0) + 1
-        if attempt > DEFAULT_CONTINUATION_LIMIT:
-            reason = (
-                f"Continuation budget ({DEFAULT_CONTINUATION_LIMIT}) exhausted after checkpoint: {summary}"
-            )
-            new_status, event_kind, set_sql, route_params, payload = _route_block(
-                "needs_input", reason, "running",
-                prev_kind=_row_get(row, "block_kind"),
-                prev_recurrences=int(_row_get(row, "block_recurrences") or 0),
-            )
-            payload.update({
-                "continuation_count": attempt,
-                "continuation_limit": DEFAULT_CONTINUATION_LIMIT,
-            })
-            cur = conn.execute(
-                f"UPDATE tasks SET status = '{new_status}', claim_lock = NULL, claim_expires = NULL, "
-                "worker_pid = NULL, worker_started_at = NULL, resume_after = NULL, "
-                f"continuation_count = ?, {set_sql} "
-                "WHERE id = ? AND status = 'running' AND current_run_id = ?",
-                (attempt, *route_params, task_id, int(expected_run_id)),
-            )
-            if cur.rowcount != 1:
-                return False, False
-            run_id = _end_run(
-                conn, task_id, outcome="continuation_exhausted", status=new_status, summary=reason,
-            )
-            _append_event(conn, task_id, event_kind, payload, run_id=run_id)
-            return True, True
-        resume_after = now + delay
+        return _checkpoint_task_locked(
+            conn, task_id, summary=summary, delay_seconds=delay,
+            expected_run_id=int(expected_run_id), metadata=metadata,
+        )
+
+
+def _checkpoint_task_locked(
+    conn: sqlite3.Connection, task_id: str, *, summary: str, delay_seconds: int,
+    expected_run_id: int, metadata: Optional[dict] = None,
+) -> tuple[bool, bool]:
+    """``checkpoint_task`` body for callers that already hold ``write_txn``."""
+    now = int(time.time())
+    row = conn.execute(
+        "SELECT status, current_run_id, continuation_count, block_kind, block_recurrences "
+        "FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None or row["status"] != "running" or row["current_run_id"] != int(expected_run_id):
+        return False, False
+    attempt = int(_row_get(row, "continuation_count") or 0) + 1
+    if attempt > DEFAULT_CONTINUATION_LIMIT:
+        reason = f"Continuation budget ({DEFAULT_CONTINUATION_LIMIT}) exhausted after checkpoint: {summary}"
+        new_status, event_kind, set_sql, route_params, payload = _route_block(
+            "needs_input", reason, "running",
+            prev_kind=_row_get(row, "block_kind"),
+            prev_recurrences=int(_row_get(row, "block_recurrences") or 0),
+        )
+        payload.update({
+            "continuation_count": attempt,
+            "continuation_limit": DEFAULT_CONTINUATION_LIMIT,
+        })
         cur = conn.execute(
-            "UPDATE tasks SET status = 'scheduled', claim_lock = NULL, claim_expires = NULL, "
-            "worker_pid = NULL, worker_started_at = NULL, resume_after = ?, continuation_count = ? "
+            f"UPDATE tasks SET status = '{new_status}', claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, worker_started_at = NULL, resume_after = NULL, "
+            f"continuation_count = ?, {set_sql} "
             "WHERE id = ? AND status = 'running' AND current_run_id = ?",
-            (resume_after, attempt, task_id, int(expected_run_id)),
+            (attempt, *route_params, task_id, int(expected_run_id)),
         )
         if cur.rowcount != 1:
             return False, False
-        run_id = _end_run(conn, task_id, outcome="checkpointed", status="scheduled", summary=summary)
-        _append_event(conn, task_id, "checkpointed", {
-            "summary": summary, "resume_after": resume_after,
-            "continuation_count": attempt, "continuation_limit": DEFAULT_CONTINUATION_LIMIT,
-        }, run_id=run_id)
-        return True, False
+        run_id = _end_run(
+            conn, task_id, outcome="continuation_exhausted", status=new_status, summary=reason,
+        )
+        _append_event(conn, task_id, event_kind, payload, run_id=run_id)
+        return True, True
+    resume_after = now + delay_seconds
+    cur = conn.execute(
+        "UPDATE tasks SET status = 'scheduled', claim_lock = NULL, claim_expires = NULL, "
+        "worker_pid = NULL, worker_started_at = NULL, resume_after = ?, continuation_count = ? "
+        "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+        (resume_after, attempt, task_id, int(expected_run_id)),
+    )
+    if cur.rowcount != 1:
+        return False, False
+    run_id = _end_run(conn, task_id, outcome="checkpointed", status="scheduled", summary=summary, metadata=metadata)
+    _append_event(conn, task_id, "checkpointed", {
+        "summary": summary, "resume_after": resume_after,
+        "continuation_count": attempt, "continuation_limit": DEFAULT_CONTINUATION_LIMIT,
+    }, run_id=run_id)
+    return True, False
+
+
+def workspace_fingerprint(workspace: str) -> Optional[str]:
+    """Stable, read-only Git workspace identity; ``None`` is not proof."""
+    path = Path(workspace)
+    if not path.is_absolute() or not path.is_dir():
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "status", "--porcelain=v1", "-z"],
+            capture_output=True, timeout=10, check=False,
+        )
+        head = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            capture_output=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode or head.returncode:
+        return None
+    return hashlib.sha256(head.stdout.strip() + b"\0" + result.stdout).hexdigest()
+
+
+def stage_fresh_process_checkpoint(
+    conn: sqlite3.Connection, task_id: str, *, handoff: dict, delay_seconds: int,
+    expected_run_id: Optional[int], workspace: str,
+) -> bool:
+    """Record a dark, zero-external-action handoff without ending its run."""
+    if expected_run_id is None:
+        return False
+    summary = handoff.get("summary") if isinstance(handoff, dict) else None
+    next_step = handoff.get("next_step") if isinstance(handoff, dict) else None
+    actions = handoff.get("external_actions") if isinstance(handoff, dict) else None
+    if (not isinstance(handoff, dict) or set(handoff) != {"summary", "next_step", "external_actions"} or
+            not isinstance(summary, str) or not summary.strip() or
+            not isinstance(next_step, str) or not next_step.strip() or actions != []):
+        raise ValueError("fresh-process handoff requires summary, next_step, and external_actions: []")
+    delay = int(delay_seconds)
+    if delay < 1 or delay > MAX_CONTINUATION_DELAY_SECONDS:
+        raise ValueError(f"checkpoint delay must be between 1 and {MAX_CONTINUATION_DELAY_SECONDS} seconds")
+    fingerprint = workspace_fingerprint(workspace)
+    if fingerprint is None:
+        return False
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id, claim_lock, claim_expires, worker_pid FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if (row is None or row["status"] != "running" or row["current_run_id"] != int(expected_run_id)
+                or not row["claim_lock"] or row["claim_expires"] is None or row["worker_pid"] is None):
+            return False
+        conn.execute(
+            "INSERT INTO fresh_process_checkpoints "
+            "(task_id, run_id, claim_lock, worker_pid, workspace_fingerprint, handoff, delay_seconds, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (task_id, int(expected_run_id), row["claim_lock"], int(row["worker_pid"]), fingerprint,
+             json.dumps({"summary": summary.strip(), "next_step": next_step.strip(), "external_actions": []}), delay,
+             int(time.time())),
+        )
+        _append_event(conn, task_id, "fresh_process_checkpoint_staged", {"run_id": int(expected_run_id)})
+    return True
+
+
+def settle_fresh_process_checkpoint_locked(
+    conn: sqlite3.Connection, task_id: str, *, run_id: int, pid: int,
+) -> tuple[bool, bool, str]:
+    """Settle a staged handoff after the dispatcher proved its clean exit.
+
+    Caller holds ``write_txn``.  The lease, run, PID and workspace proof are
+    all checked again here; any uncertainty is a failure, never a continuation.
+    """
+    pending = conn.execute(
+        "SELECT claim_lock, worker_pid, workspace_fingerprint, handoff, delay_seconds "
+        "FROM fresh_process_checkpoints WHERE task_id = ? AND run_id = ?", (task_id, run_id),
+    ).fetchone()
+    if pending is None:
+        return False, False, "missing checkpoint"
+    row = conn.execute(
+        "SELECT claim_lock, claim_expires, worker_pid, workspace_path, status, current_run_id "
+        "FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    now = int(time.time())
+    if (row is None or row["status"] != "running" or row["current_run_id"] != run_id
+            or row["claim_lock"] != pending["claim_lock"] or row["worker_pid"] != pid
+            or int(pending["worker_pid"]) != pid or row["claim_expires"] is None
+            or int(row["claim_expires"]) < now):
+        return False, False, "run or lease proof changed"
+    fingerprint = workspace_fingerprint(row["workspace_path"] or "")
+    if fingerprint is None or fingerprint != pending["workspace_fingerprint"]:
+        return False, False, "workspace fingerprint changed or could not be verified"
+    handoff = _json_dict(pending["handoff"])
+    ok, exhausted = _checkpoint_task_locked(
+        conn, task_id, summary=handoff.get("summary", ""), delay_seconds=int(pending["delay_seconds"]),
+        expected_run_id=run_id, metadata={"fresh_process_handoff": handoff},
+    )
+    if not ok:
+        return False, exhausted, "continuation state changed"
+    conn.execute("DELETE FROM fresh_process_checkpoints WHERE task_id = ? AND run_id = ?", (task_id, run_id))
+    return True, exhausted, ""
+
+
+def reject_fresh_process_checkpoint_locked(
+    conn: sqlite3.Connection, task_id: str, *, run_id: int, reason: str,
+) -> None:
+    """Fail closed: retain no pending handoff and hold the card for review."""
+    row = conn.execute("SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None or row["status"] != "running" or row["current_run_id"] != run_id:
+        # A reclaimed successor must never be changed by an old worker's exit
+        # trailer. Discard only the stale pilot record; it has no authority.
+        conn.execute("DELETE FROM fresh_process_checkpoints WHERE task_id = ? AND run_id = ?", (task_id, run_id))
+        return
+    conn.execute(
+        "UPDATE tasks SET status = 'blocked', claim_lock = NULL, claim_expires = NULL, "
+        "worker_pid = NULL, worker_started_at = NULL WHERE id = ? AND current_run_id = ?",
+        (task_id, run_id),
+    )
+    closed = _end_run(conn, task_id, outcome="fresh_process_checkpoint_rejected", status="blocked", error=reason)
+    conn.execute("DELETE FROM fresh_process_checkpoints WHERE task_id = ? AND run_id = ?", (task_id, run_id))
+    _append_event(conn, task_id, "fresh_process_checkpoint_rejected", {"reason": reason}, run_id=closed)
+    _ep().emit_status_changed(conn, task_id, from_status="running", to_status="blocked", run_id=closed)
 
 
 def resume_due_checkpoints(conn: sqlite3.Connection, *, now: Optional[int] = None) -> list[str]:
@@ -4382,6 +4525,16 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     now = int(time.time())
     lines: list[str] = []
     _ctx_header(lines, task)
+    fresh = conn.execute(
+        "SELECT metadata FROM task_runs WHERE task_id = ? AND outcome = 'checkpointed' "
+        "AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    handoff = _json_dict(fresh["metadata"] if fresh else None).get("fresh_process_handoff")
+    if isinstance(handoff, dict) and handoff.get("external_actions") == []:
+        summary, next_step = handoff.get("summary"), handoff.get("next_step")
+        if isinstance(summary, str) and isinstance(next_step, str):
+            lines.extend(["", "## Fresh-process checkpoint", summary.strip(), "", f"Next step: {next_step.strip()}"])
+            return "\n".join(lines).rstrip() + "\n"
     _ctx_attachments(lines, list_attachments(conn, task_id))
     _ctx_prior_attempts(lines, conn, task_id, now)
     _ctx_parent_results(lines, conn, task_id, now)

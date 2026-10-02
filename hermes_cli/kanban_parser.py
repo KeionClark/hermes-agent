@@ -330,9 +330,11 @@ _SPECS = [
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("checkpoint", [
         _TASK_ID,
-        _arg("summary", nargs="+", help="Concrete progress and next step for the same-card continuation"),
+        _arg("summary", nargs="*", help="Concrete progress and next step for the same-card continuation"),
         _arg("--delay-seconds", type=int, default=60,
              help="Resume delay in seconds (default: 60; maximum: 3600)"),
+        _arg("--fresh-process-handoff", metavar="JSON",
+             help="Dark opt-in: exact JSON {summary,next_step,external_actions:[]} settled only after clean exit"),
     ], help="Checkpoint unfinished engineering and schedule one bounded same-card continuation"),
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),

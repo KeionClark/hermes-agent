@@ -817,11 +817,21 @@ def _handle_block(args: dict, **kw) -> str:
 def _handle_checkpoint(args: dict, **kw) -> str:
     """Record bounded progress and schedule the same active card to resume."""
     tid = _worker_guard("kanban_checkpoint", args)
-    summary = _redact(_require_text(args, "summary", "summary is required"))
     delay = args.get("delay_seconds", 60)
     if isinstance(delay, bool) or not isinstance(delay, int):
         raise _Reject("delay_seconds must be an integer")
     with _board(args.get("board")) as (kb, conn):
+        handoff = args.get("fresh_process_handoff")
+        if handoff is not None:
+            _check(isinstance(handoff, dict), "fresh_process_handoff must be an object")
+            workspace = os.environ.get("HERMES_KANBAN_WORKSPACE", "")
+            ok = kb.stage_fresh_process_checkpoint(
+                conn, tid, handoff=handoff, delay_seconds=delay,
+                expected_run_id=_worker_run_id(tid), workspace=workspace,
+            )
+            _check(ok, "could not stage fresh-process checkpoint (run, lease, worker PID, or workspace proof missing)")
+            return _ok_landed(kb, conn, tid, "running", fresh_process_checkpoint_staged=True)
+        summary = _redact(_require_text(args, "summary", "summary is required"))
         ok, exhausted = kb.checkpoint_task(
             conn, tid, summary=summary, delay_seconds=delay,
             expected_run_id=_worker_run_id(tid),

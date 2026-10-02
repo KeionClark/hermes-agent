@@ -1029,7 +1029,28 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
 
 def _cmd_checkpoint(args: argparse.Namespace) -> int:
     summary = _joined_words(args.summary)
+    raw_handoff = getattr(args, "fresh_process_handoff", None)
+    handoff = None
+    if raw_handoff:
+        try:
+            handoff = json.loads(raw_handoff)
+        except json.JSONDecodeError as exc:
+            return _err(f"kanban checkpoint: --fresh-process-handoff: {exc}", 2)
+        if summary:
+            return _err("kanban checkpoint: pass either summary or --fresh-process-handoff, not both", 2)
+    elif not summary:
+        return _err("kanban checkpoint: summary is required", 2)
     with kbc.connect_closing() as conn:
+        if handoff is not None:
+            ok = kb.stage_fresh_process_checkpoint(
+                conn, args.task_id, handoff=handoff, delay_seconds=args.delay_seconds,
+                expected_run_id=_worker_run_id_for(args.task_id),
+                workspace=os.environ.get("HERMES_KANBAN_WORKSPACE", ""),
+            )
+            if not ok:
+                return _err(f"cannot stage fresh-process checkpoint for {args.task_id} (requires active exact run and Git workspace proof)")
+            print(f"Staged fresh-process checkpoint for {args.task_id}; awaiting clean worker exit")
+            return 0
         ok, exhausted = kb.checkpoint_task(
             conn, args.task_id, summary=summary, delay_seconds=args.delay_seconds,
             expected_run_id=_worker_run_id_for(args.task_id),
