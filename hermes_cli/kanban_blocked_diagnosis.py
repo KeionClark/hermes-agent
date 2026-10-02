@@ -17,14 +17,32 @@ AUTHOR = "blocked-diagnosis"
 IDLE_SECONDS = 4 * 3600
 # A tick must finish in bounded time even on a long-lived board.
 BATCH_SIZE = 100
+# Metadata is bounded from the block for unresolved receipts, and from the
+# transition for resolved outcomes. This ledger is not an audit archive.
+RETENTION_SECONDS = 30 * 86400
 
 
 def migrate(conn: sqlite3.Connection) -> None:
     """Additive, explicitly invoked board-local migration; no reason/PII ledger."""
     with kb.write_txn(conn):
-        conn.execute("CREATE TABLE IF NOT EXISTS blocked_diagnosis_cursor (singleton INTEGER PRIMARY KEY CHECK(singleton=1), event_id INTEGER NOT NULL)")
-        conn.execute("CREATE TABLE IF NOT EXISTS blocked_diagnosis_receipts (task_id TEXT NOT NULL, blocked_event_id INTEGER NOT NULL, action TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY(task_id, blocked_event_id, action))")
-        conn.execute("INSERT OR IGNORE INTO blocked_diagnosis_cursor VALUES (1, 0)")
+        conn.execute("CREATE TABLE IF NOT EXISTS blocked_diagnosis_cursor (singleton INTEGER PRIMARY KEY CHECK(singleton=1), event_id INTEGER NOT NULL, candidate_event_id INTEGER NOT NULL DEFAULT 0)")
+        conn.execute("CREATE TABLE IF NOT EXISTS blocked_diagnosis_receipts (task_id TEXT NOT NULL, blocked_event_id INTEGER NOT NULL, action TEXT NOT NULL, created_at INTEGER NOT NULL, blocked_at INTEGER NOT NULL DEFAULT 0, resolved_at INTEGER, transition_event_id INTEGER, PRIMARY KEY(task_id, blocked_event_id, action))")
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(blocked_diagnosis_cursor)")}
+        if "candidate_event_id" not in columns:
+            conn.execute("ALTER TABLE blocked_diagnosis_cursor ADD COLUMN candidate_event_id INTEGER NOT NULL DEFAULT 0")
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(blocked_diagnosis_receipts)")}
+        for name, sql in (("blocked_at", "INTEGER NOT NULL DEFAULT 0"), ("resolved_at", "INTEGER"),
+                          ("transition_event_id", "INTEGER")):
+            if name not in columns:
+                conn.execute(f"ALTER TABLE blocked_diagnosis_receipts ADD COLUMN {name} {sql}")
+        # Pre-upgrade receipts keep their original event's timestamp, not their
+        # later processing timestamp. Do not alter existing outcome semantics.
+        conn.execute("UPDATE blocked_diagnosis_receipts SET blocked_at = "
+                     "COALESCE((SELECT created_at FROM task_events WHERE id = blocked_event_id), created_at) "
+                     "WHERE blocked_at = 0")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_blocked_diagnosis_receipts_age "
+                     "ON blocked_diagnosis_receipts(action, blocked_at, resolved_at)")
+        conn.execute("INSERT OR IGNORE INTO blocked_diagnosis_cursor (singleton, event_id) VALUES (1, 0)")
 
 
 def _payload(row: sqlite3.Row) -> dict[str, Any]:
@@ -111,11 +129,16 @@ def _diagnose(conn: sqlite3.Connection, row: sqlite3.Row, now: int) -> dict[str,
             "historical_sweep_at": None, "historical_sweep_latency_seconds": None}
 
 
-def _receipt(conn: sqlite3.Connection, diagnosis: dict[str, Any], action: str, now: int) -> bool:
+def _receipt(conn: sqlite3.Connection, diagnosis: dict[str, Any], action: str, now: int,
+             outcome: dict[str, Any] | None = None) -> bool:
     task_id, event_id = diagnosis["task_id"], diagnosis["blocked_event_id"]
     inserted = conn.execute(
-        "INSERT OR IGNORE INTO blocked_diagnosis_receipts VALUES (?, ?, ?, ?)",
-        (task_id, event_id, action, now)).rowcount
+        "INSERT OR IGNORE INTO blocked_diagnosis_receipts "
+        "(task_id, blocked_event_id, action, created_at, blocked_at, resolved_at, transition_event_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (task_id, event_id, action, now, diagnosis["blocked_at"],
+         outcome["resolved_at"] if outcome else None,
+         outcome["transition_event_id"] if outcome else None)).rowcount
     if inserted and (
         (action == "diagnose" and diagnosis["status"] in {"blocked", "todo"})
         or (action == "idle-4h" and diagnosis["status"] in {"blocked", "todo"})
@@ -157,9 +180,22 @@ def consume(conn: sqlite3.Connection, *, now: int | None = None, limit: int = BA
     now = int(time.time()) if now is None else int(now)
     diagnoses, outcomes, alerts = [], [], []
     with kb.write_txn(conn):
-        cursor = conn.execute("SELECT event_id FROM blocked_diagnosis_cursor WHERE singleton=1").fetchone()
+        cursor = conn.execute("SELECT event_id, candidate_event_id FROM blocked_diagnosis_cursor WHERE singleton=1").fetchone()
         if cursor is None:
             raise RuntimeError("blocked diagnosis migration/activation required")
+        # Purge by event age even when the card remains blocked forever. A
+        # bounded batch per tick avoids holding the writer lock over the board.
+        expired = conn.execute(
+            "SELECT task_id, blocked_event_id FROM blocked_diagnosis_receipts "
+            "WHERE (action = 'resolved' AND resolved_at <= ?) OR "
+            "(action != 'resolved' AND blocked_at <= ?) LIMIT ?",
+            (now - RETENTION_SECONDS, now - RETENTION_SECONDS, limit)).fetchall()
+        for old in expired:
+            conn.execute("DELETE FROM blocked_diagnosis_receipts WHERE task_id=? AND blocked_event_id=? "
+                         "AND ((action='resolved' AND resolved_at <= ?) OR "
+                         "(action!='resolved' AND blocked_at <= ?))",
+                         (old["task_id"], old["blocked_event_id"],
+                          now - RETENTION_SECONDS, now - RETENTION_SECONDS))
         rows = conn.execute("SELECT id, task_id, kind, payload, created_at FROM task_events WHERE id > ? ORDER BY id LIMIT ?",
                             (cursor["event_id"], limit)).fetchall()
         for event in rows:
@@ -168,29 +204,37 @@ def consume(conn: sqlite3.Connection, *, now: int | None = None, limit: int = BA
             ):
                 diagnosis = _diagnose(conn, event, now)
                 diagnoses.append(diagnosis)
-                if diagnosis["status"] in {"blocked", "todo"}:
+                if event["created_at"] > now - RETENTION_SECONDS:
                     _receipt(conn, diagnosis, "diagnose", now)
             conn.execute("UPDATE blocked_diagnosis_cursor SET event_id = ? WHERE singleton=1", (event["id"],))
         # Only previously diagnosed blocks, bounded by the receipt table and live state.
-        candidates = conn.execute(
-            "SELECT e.id, e.task_id, e.kind, e.payload, e.created_at, r.action FROM blocked_diagnosis_receipts r "
-            "JOIN task_events e ON e.id = r.blocked_event_id AND e.task_id = r.task_id "
-            "WHERE r.action = 'diagnose' ORDER BY e.id LIMIT ?", (limit,)).fetchall()
+        def candidate_batch(after: int) -> list[sqlite3.Row]:
+            return conn.execute(
+                "SELECT e.id, e.task_id, e.kind, e.payload, e.created_at FROM blocked_diagnosis_receipts r "
+                "JOIN task_events e ON e.id = r.blocked_event_id AND e.task_id = r.task_id "
+                "WHERE r.action = 'diagnose' AND e.id > ? AND r.blocked_at > ? "
+                "AND NOT EXISTS (SELECT 1 FROM blocked_diagnosis_receipts x WHERE "
+                "x.task_id=r.task_id AND x.blocked_event_id=r.blocked_event_id "
+                "AND x.action IN ('resolved', 'closed')) ORDER BY e.id LIMIT ?",
+                (after, now - RETENTION_SECONDS, limit)).fetchall()
+        candidates = candidate_batch(cursor["candidate_event_id"])
+        if not candidates:
+            candidates = candidate_batch(0)
         for row in candidates:
             diagnosis = _diagnose(conn, row, now)
             if diagnosis["status"] in {"blocked", "todo"} and diagnosis["idle_seconds"] >= IDLE_SECONDS:
                 if _receipt(conn, diagnosis, "idle-4h", now):
                     alerts.append(diagnosis)
             outcome = _outcome(conn, row, diagnosis["route"])
-            if outcome and _receipt(conn, diagnosis, "resolved", now):
+            if outcome and _receipt(conn, diagnosis, "resolved", now, outcome):
                 outcomes.append(outcome)
-                conn.execute("DELETE FROM blocked_diagnosis_receipts WHERE task_id = ? AND blocked_event_id = ?",
-                             (row["task_id"], row["id"]))
             elif diagnosis["status"] in {"archived", "done", "missing"} or conn.execute(
                 "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? AND kind IN "
                 "('blocked', 'dependency_wait', 'block_loop_detected') LIMIT 1",
                 (row["task_id"], row["id"])).fetchone():
-                conn.execute("DELETE FROM blocked_diagnosis_receipts WHERE task_id = ? AND blocked_event_id = ?",
-                             (row["task_id"], row["id"]))
+                _receipt(conn, diagnosis, "closed", now)
+        if candidates:
+            conn.execute("UPDATE blocked_diagnosis_cursor SET candidate_event_id=? WHERE singleton=1",
+                         (candidates[-1]["id"],))
     return {"cursor": rows[-1]["id"] if rows else cursor["event_id"],
             "diagnoses": diagnoses, "idle_alerts": alerts, "outcomes": outcomes}

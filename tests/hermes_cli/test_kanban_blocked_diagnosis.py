@@ -5,7 +5,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
-from hermes_cli.kanban_blocked_diagnosis import consume, migrate, IDLE_SECONDS
+from hermes_cli.kanban_blocked_diagnosis import consume, migrate, IDLE_SECONDS, RETENTION_SECONDS
 
 
 @pytest.fixture
@@ -153,3 +153,102 @@ def test_real_unblock_ready_emits_outcome_without_approving_block(board):
     assert result[0]["blocked_at"] == first["blocked_at"]
     assert result[0]["route"] == first["route"]
     assert not consume(board)["outcomes"]
+
+
+def test_persistent_oldest_blocks_do_not_starve_new_eligible_outcome(board):
+    tasks = [block(board) for _ in range(105)]
+    migrate(board)
+    consume(board)
+    consume(board)
+    target = tasks[-1]
+    assert kb.unblock_task(board, target)
+    outcome = consume(board)["outcomes"] + consume(board)["outcomes"]
+    assert [row["task_id"] for row in outcome] == [target]
+    assert kb.get_task(board, tasks[0]).status == "blocked"
+    assert not consume(board)["outcomes"]
+    persisted = board.execute(
+        "SELECT blocked_at, resolved_at, transition_event_id FROM blocked_diagnosis_receipts "
+        "WHERE task_id=? AND action='resolved'", (target,)).fetchone()
+    assert persisted["blocked_at"] == outcome[0]["blocked_at"]
+    assert persisted["resolved_at"] == outcome[0]["resolved_at"]
+    assert persisted["transition_event_id"] == outcome[0]["transition_event_id"]
+    assert not board.execute("SELECT 1 FROM blocked_diagnosis_receipts WHERE action='resolved' "
+                             "AND task_id=?", (tasks[0],)).fetchone()
+
+
+def test_retention_restart_and_schema_rollback(board):
+    unresolved, resolved = block(board), block(board)
+    migrate(board)
+    consume(board)
+    assert kb.unblock_task(board, resolved)
+    outcome = consume(board)["outcomes"][0]
+    db_path = board.execute("PRAGMA database_list").fetchone()["file"]
+    # A new connection represents an interrupted watcher restart.
+    import sqlite3
+    reopened = sqlite3.connect(db_path)
+    reopened.row_factory = sqlite3.Row
+    try:
+        migrate(reopened)
+        assert not consume(reopened)["outcomes"]
+        consume(reopened, now=outcome["blocked_at"] + RETENTION_SECONDS + 2)
+        assert not reopened.execute("SELECT 1 FROM blocked_diagnosis_receipts WHERE task_id=?",
+                                    (unresolved,)).fetchone()
+        assert not reopened.execute("SELECT 1 FROM blocked_diagnosis_receipts WHERE task_id=?",
+                                    (resolved,)).fetchone()
+        before = reopened.execute("SELECT status FROM tasks WHERE id=?", (unresolved,)).fetchone()[0]
+        for table in ("blocked_diagnosis_receipts", "blocked_diagnosis_cursor"):
+            reopened.execute(f"DROP TABLE {table}")
+        reopened.commit()
+        assert reopened.execute("SELECT status FROM tasks WHERE id=?", (unresolved,)).fetchone()[0] == before
+        with pytest.raises(sqlite3.OperationalError):
+            consume(reopened)
+    finally:
+        reopened.close()
+
+
+def test_resolved_metadata_retained_from_transition_and_legacy_migration(board):
+    task = block(board)
+    blocked = board.execute("SELECT id, created_at FROM task_events WHERE task_id=? AND kind='blocked'",
+                            (task,)).fetchone()
+    # Simulate an already-enabled old schema: migration is additive and backfills
+    # the actual event time, not the time the old receipt was inserted.
+    board.execute("CREATE TABLE blocked_diagnosis_cursor (singleton INTEGER PRIMARY KEY, event_id INTEGER NOT NULL)")
+    board.execute("INSERT INTO blocked_diagnosis_cursor VALUES (1, ?)", (blocked["id"],))
+    board.execute("CREATE TABLE blocked_diagnosis_receipts (task_id TEXT NOT NULL, blocked_event_id INTEGER NOT NULL, "
+                  "action TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY(task_id, blocked_event_id, action))")
+    board.execute("INSERT INTO blocked_diagnosis_receipts VALUES (?, ?, 'diagnose', ?)",
+                  (task, blocked["id"], blocked["created_at"] + 100))
+    board.commit()
+    migrate(board)
+    migrate(board)
+    assert board.execute("SELECT blocked_at FROM blocked_diagnosis_receipts WHERE task_id=?",
+                         (task,)).fetchone()[0] == blocked["created_at"]
+    assert kb.unblock_task(board, task)
+    outcome = consume(board)["outcomes"][0]
+    assert outcome["transition_event_id"] > blocked["id"]
+    # Age the block, but not the transition; the outcome remains readable.
+    board.execute("UPDATE blocked_diagnosis_receipts SET blocked_at=? WHERE task_id=?",
+                  (blocked["created_at"] - RETENTION_SECONDS, task))
+    board.commit()
+    consume(board, now=outcome["resolved_at"] + RETENTION_SECONDS - 1)
+    assert board.execute("SELECT transition_event_id FROM blocked_diagnosis_receipts "
+                         "WHERE task_id=? AND action='resolved'", (task,)).fetchone()[0] == outcome["transition_event_id"]
+    consume(board, now=outcome["resolved_at"] + RETENTION_SECONDS + 1)
+    assert not board.execute("SELECT 1 FROM blocked_diagnosis_receipts WHERE task_id=?", (task,)).fetchone()
+
+
+def test_interrupted_tick_rolls_back_cursor_and_receipts(board, monkeypatch):
+    task = block(board)
+    migrate(board)
+    import hermes_cli.kanban_blocked_diagnosis as diagnosis
+    original = diagnosis._outcome
+    def interrupted(*args):
+        raise RuntimeError("interrupted before commit")
+    monkeypatch.setattr(diagnosis, "_outcome", interrupted)
+    with pytest.raises(RuntimeError, match="interrupted"):
+        consume(board)
+    assert board.execute("SELECT event_id FROM blocked_diagnosis_cursor").fetchone()[0] == 0
+    assert not board.execute("SELECT 1 FROM blocked_diagnosis_receipts WHERE task_id=?", (task,)).fetchone()
+    monkeypatch.setattr(diagnosis, "_outcome", original)
+    assert [item["task_id"] for item in consume(board)["diagnoses"]] == [task]
+    assert len(kb.list_comments(board, task)) == 1
