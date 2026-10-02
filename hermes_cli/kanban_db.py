@@ -1370,6 +1370,8 @@ def create_task(
                     idempotency_key=idempotency_key,
                 )
                 task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
+                if task_status == "todo" and parents and all(_parent_fulfilled(conn, p) for p in parents):
+                    task_status = "ready"  # completed then archived parents are fulfilled
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
                 if project_obj is not None and workspace_kind == "worktree":
@@ -1434,7 +1436,7 @@ def create_task(
                 if task_status == "todo":
                     # Parked behind an open parent: record why, exactly as
                     # link_tasks does, so the board never shows an unexplained todo.
-                    gating = [p for p in parents if _task_status(conn, p) not in ("done", "archived")]
+                    gating = [p for p in parents if not _parent_fulfilled(conn, p)]
                     if gating:
                         _append_event(
                             conn,
@@ -1787,9 +1789,8 @@ def link_tasks(
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
         _link(conn, parent_id, child_id)
-        # If child was ready but parent is not yet terminal, demote child to todo
-        # (archived counts as terminal, matching _parents_satisfied/recompute_ready).
-        if _task_status(conn, parent_id) not in ("done", "archived"):
+        # Archive alone does not fulfill a prerequisite; only completed archives do.
+        if not _parent_fulfilled(conn, parent_id):
             cur = conn.execute(
                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
                 (child_id,),
@@ -2294,7 +2295,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
 
 
 def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
-    """Promote ``todo``/``blocked`` tasks whose parents are all done/archived;
+    """Promote ``todo``/``blocked`` tasks whose parents are all fulfilled;
     returns the count. Opens its own IMMEDIATE txn — call OUTSIDE any write txn.
 
     ``blocked`` is skipped when sticky (explicit ``kanban_block``) or when
@@ -2320,11 +2321,11 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
                 # Explicit human-intervention block; only ``unblock_task`` may exit it.
                 continue
             parents = conn.execute(
-                "SELECT t.status FROM tasks t "
+                "SELECT t.status, t.completed_at FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
                 "WHERE l.child_id = ?", (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            if all(_parent_row_fulfilled(p) for p in parents):
                 resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
                     # At the breaker limit, no auto-recovery (else block ->
@@ -2358,25 +2359,35 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
 
 # --- Claim / complete / block ---
 
+def _parent_row_fulfilled(row: sqlite3.Row) -> bool:
+    """Archiving unfinished work must not discharge its dependent work."""
+    return row["status"] == "done" or (row["status"] == "archived" and row["completed_at"] is not None)
+
+
+def _parent_fulfilled(conn: sqlite3.Connection, task_id: str) -> bool:
+    row = conn.execute("SELECT status, completed_at FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return row is not None and _parent_row_fulfilled(row)
+
+
 def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return whether every direct parent is terminal for dependency gating."""
+    """Return whether every direct parent has completed (even if archived)."""
     return conn.execute(
         "SELECT 1 FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
         "WHERE l.child_id = ? "
-        "AND p.status NOT IN ('done', 'archived') LIMIT 1", (task_id,),
+        "AND NOT (p.status = 'done' OR (p.status = 'archived' AND p.completed_at IS NOT NULL)) LIMIT 1", (task_id,),
     ).fetchone() is None
 
 
 def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, str]]:
     """``(parent_id, status)`` for every direct parent :func:`_parents_satisfied`
-    still counts as open (``done`` / ``archived`` release the child), in id
+    still counts as open (``done`` / completed-and-archived release the child), in id
     order, so a refusal or a board view can name the blockers instead of the
     caller guessing. Read-only."""
     rows = conn.execute(
         "SELECT p.id, p.status FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
-        "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') "
+        "WHERE l.child_id = ? AND NOT (p.status = 'done' OR (p.status = 'archived' AND p.completed_at IS NOT NULL)) "
         "ORDER BY p.id", (task_id,),
     ).fetchall()
     return [(row["id"], row["status"]) for row in rows]
@@ -3776,11 +3787,11 @@ def promote_task(
     # writer set 'ready', so a forced promotion would only report a success the
     # first claim silently reverts (#106195). The dependency itself is the knob.
     parents = conn.execute(
-        "SELECT t.id, t.status FROM tasks t "
+        "SELECT t.id, t.status, t.completed_at FROM tasks t "
         "JOIN task_links l ON l.parent_id = t.id "
         "WHERE l.child_id = ?", (task_id,),
     ).fetchall()
-    unsatisfied = [p["id"] for p in parents if p["status"] not in ("done", "archived")]
+    unsatisfied = [p["id"] for p in parents if not _parent_row_fulfilled(p)]
     if unsatisfied:
         return False, (
             f"unsatisfied parent dependencies: {', '.join(unsatisfied)} "
@@ -4174,7 +4185,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
         termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
         with write_txn(conn):
             _append_event(conn, task_id, "archive_worker_termination", termination, run_id=run_id)
-    # ``archived`` parents no longer block children; promote them now.
+    # Only a parent archived after completion releases children.
     recompute_ready(conn)
     # Reap the workspace on archive too (never-completed tasks kept it forever).
     _cleanup_workspace(conn, task_id)

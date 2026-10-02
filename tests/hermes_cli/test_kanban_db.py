@@ -1479,10 +1479,11 @@ def test_create_task_with_open_parent_emits_dependency_wait(kanban_home):
 
 
 def test_link_tasks_archived_parent_is_terminal_no_gate(kanban_home):
-    """archived is terminal for recompute_ready, so linking under an archived
+    """completed then archived is fulfilled for recompute_ready, so linking under an archived
     parent must not demote a ready child (it would only flap back to ready)."""
     with kbc.connect() as conn:
         parent = kb.create_task(conn, title="archived parent")
+        kb.complete_task(conn, parent, result="done")
         kb.archive_task(conn, parent)
         child = kb.create_task(conn, title="child")
         assert kb.get_task(conn, child).status == "ready"

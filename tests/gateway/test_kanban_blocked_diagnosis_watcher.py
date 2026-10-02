@@ -10,6 +10,17 @@ from hermes_cli import kanban_db_connect as kbc
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 
 
+def test_diagnosis_board_allowlist_is_off_by_default_and_resolves_from_config(tmp_path: Path, monkeypatch):
+    from hermes_cli.config import load_config
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    assert load_config()["kanban"]["blocked_diagnosis_boards"] == []
+    (home / "config.yaml").write_text("kanban:\n  blocked_diagnosis_boards: [private-test]\n")
+    assert load_config()["kanban"]["blocked_diagnosis_boards"] == ["private-test"]
+
+
 @pytest.mark.asyncio
 async def test_bounded_watcher_consumes_blocked_event_only_when_lock_owned(tmp_path: Path, monkeypatch):
     home = tmp_path / ".hermes"

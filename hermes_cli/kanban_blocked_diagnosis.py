@@ -37,7 +37,7 @@ def _payload(row: sqlite3.Row) -> dict[str, Any]:
 
 def _parents(conn: sqlite3.Connection, task_id: str) -> list[dict[str, str]]:
     return [dict(row) for row in conn.execute(
-        "SELECT l.parent_id AS id, COALESCE(t.status, 'missing') AS status FROM task_links l "
+        "SELECT l.parent_id AS id, COALESCE(t.status, 'missing') AS status, t.completed_at FROM task_links l "
         "LEFT JOIN tasks t ON t.id = l.parent_id WHERE l.child_id = ? ORDER BY l.parent_id", (task_id,))]
 
 
@@ -91,9 +91,12 @@ def _diagnose(conn: sqlite3.Connection, row: sqlite3.Row, now: int) -> dict[str,
     }.get(kind, "owner_classify_block")
     if cycles:
         route = "owner_review_cycle_edges_no_auto_unlink"
-    elif any(p["status"] in {"archived", "missing"} for p in parents):
+    elif any(p["status"] == "missing" or
+             (p["status"] == "archived" and p["completed_at"] is None) for p in parents):
         route = "owner_link_replacement_for_unfulfilled_archived_parent"
-    elif kind == "dependency" and any(p["status"] != "done" for p in parents):
+    elif kind == "dependency" and any(p["status"] != "done" and
+                                      not (p["status"] == "archived" and p["completed_at"] is not None)
+                                      for p in parents):
         route = "wait_for_parent_completion"
     elif kind == "transient" and task and int(task["block_recurrences"] or 0) > 1:
         route = "owner_review_retry_cap_no_auto_retry"

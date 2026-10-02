@@ -53,7 +53,6 @@ def test_sticky_kinds_do_not_auto_resolve(board, kind):
     assert not consume(board)["outcomes"]
 
 
-@pytest.mark.xfail(strict=True, reason="core archive_task currently promotes a child despite unfulfilled archived parent; core edit outside P3b ownership")
 def test_dependency_parent_states_and_archived_predecessor(board):
     parent = kb.create_task(board, title="prerequisite", assignee="owner")
     child = kb.create_task(board, title="synthetic dependent", assignee="owner")
@@ -71,10 +70,30 @@ def test_dependency_parent_states_and_archived_predecessor(board):
     consume(board)
     assert kb.archive_task(board, parent)
     assert kb.get_task(board, child).status == "todo"
-    # Kernel can treat archived prerequisites as satisfied; diagnosis must not.
-    row = board.execute("SELECT id, task_id, kind, payload, created_at FROM task_events WHERE task_id=? AND kind='dependency_wait'", (child,)).fetchone()
+    assert kb.unsatisfied_parents(board, child) == [(parent, "archived")]
+    assert not kb.claim_task(board, child)
+    assert not kb.recompute_ready(board)
+    # Diagnosis agrees with the kernel: an unfinished archived parent still gates.
     from hermes_cli.kanban_blocked_diagnosis import _parents
     assert _parents(board, child)[0]["status"] == "archived"
+
+
+def test_unfulfilled_archived_parent_gates_creation_and_link_but_completed_archive_does_not(board):
+    abandoned = kb.create_task(board, title="unfinished predecessor")
+    assert kb.archive_task(board, abandoned)
+    waiting = kb.create_task(board, title="dependent", parents=[abandoned])
+    assert kb.get_task(board, waiting).status == "todo"
+    assert kb.unsatisfied_parents(board, waiting) == [(abandoned, "archived")]
+    ready = kb.create_task(board, title="ready")
+    assert kb.link_tasks(board, abandoned, ready)
+    assert kb.get_task(board, ready).status == "todo"
+
+    fulfilled = kb.create_task(board, title="finished predecessor")
+    assert kb.complete_task(board, fulfilled, result="done")
+    assert kb.archive_task(board, fulfilled)
+    child = kb.create_task(board, title="fulfilled child", parents=[fulfilled])
+    assert kb.get_task(board, child).status == "ready"
+    assert kb.claim_task(board, child)
 
 
 def test_cycle_and_retry_cap_are_diagnostic_only(board):
