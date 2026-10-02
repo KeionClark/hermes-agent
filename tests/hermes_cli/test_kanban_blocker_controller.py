@@ -97,8 +97,9 @@ def test_apply_creates_one_runnable_resolver_and_targets_ready_alert(kanban_home
         resolver = kb.get_task(conn, first["resolver_task_ids"][0])
         assert resolver.status == "ready"
         assert resolver.assignee == "chief"
+        assert "@chief must post `[changed-condition] <specific evidence>`" in resolver.body
         assert first["ready_alert_task_ids"] == [ready]
-        assert second["resolver_task_ids"] == first["resolver_task_ids"]
+        assert second["resolver_task_ids"] == []
         assert second["ready_alert_task_ids"] == []
         assert conn.execute("SELECT count(*) FROM task_events").fetchone()[0] == event_count
         assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == task_count
@@ -151,6 +152,8 @@ def test_terminal_resolver_waits_for_explicit_changed_condition_marker(kanban_ho
         assert kb.get_task(conn, root).status == "blocked"
         assert apply_tick(conn, report)["resolver_task_ids"] == []
 
+        kb.add_comment(conn, root, "other", "[changed-condition] repository route has been restored")
+        assert apply_tick(conn, report)["resolver_task_ids"] == []
         kb.add_comment(conn, root, "chief", "[changed-condition] repository route has been restored")
         changed = apply_tick(conn, report)
         assert len(changed["resolver_task_ids"]) == 1
@@ -167,3 +170,20 @@ def test_apply_selects_highest_priority_critical_root_first(kanban_home: Path) -
         applied = apply_tick(conn, report, max_resolvers=1)
         resolver = kb.get_task(conn, applied["resolver_task_ids"][0])
         assert "P100 root" in resolver.title
+
+
+def test_changed_condition_does_not_duplicate_an_active_resolver(kanban_home: Path) -> None:
+    with kbc.connect() as conn:
+        root = kb.create_task(conn, title="access gate", assignee="chief", priority=100)
+        blocked_at = _block(conn, root)
+        report = controller_tick(conn, now=blocked_at + 25 * 60 * 60)
+        first = apply_tick(conn, report)
+        kb.add_comment(conn, root, "chief", "[changed-condition] route changed")
+        assert apply_tick(conn, report)["resolver_task_ids"] == []
+        assert len([task for task in kb.list_tasks(conn) if task.title.startswith("Resolve gate:")]) == 1
+        resolver = first["resolver_task_ids"][0]
+        assert kb.claim_task(conn, resolver)
+        assert kb.complete_task(conn, resolver, result="old verification finished")
+        second = apply_tick(conn, report)
+        assert len(second["resolver_task_ids"]) == 1
+        assert second["resolver_task_ids"][0] != resolver

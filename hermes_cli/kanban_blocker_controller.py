@@ -164,11 +164,27 @@ def controller_tick(
 
 
 def _condition_revision(conn: sqlite3.Connection, root_id: str) -> str:
-    """Explicit operator evidence advances a terminal resolver's retry identity."""
+    """Only the root owner may advance a terminal resolver's retry identity."""
+    root = kb.get_task(conn, root_id)
+    owner = root.assignee if root else None
+    if not owner:
+        return "initial"
     for comment in reversed(kb.list_comments(conn, root_id)):
-        if comment.author != "blocker-controller" and "[changed-condition]" in comment.body.casefold():
+        if comment.author == owner and "[changed-condition]" in comment.body.casefold():
             return f"comment-{comment.id}"
     return "initial"
+
+
+def _active_resolver_id(conn: sqlite3.Connection, root_id: str) -> Optional[str]:
+    """Return an unfinished resolver linked to this root by its durable create event."""
+    for event in conn.execute("SELECT task_id, payload FROM task_events WHERE kind = 'created' ORDER BY id DESC"):
+        resolver = _event_payload(event).get("blocked_root_resolver")
+        if not isinstance(resolver, dict) or resolver.get("root") != root_id:
+            continue
+        task = kb.get_task(conn, event["task_id"])
+        if task is not None and task.status not in {"done", "archived"}:
+            return task.id
+    return None
 
 
 def _resolver_purpose(conn: sqlite3.Connection, root_id: str, reason: str) -> str:
@@ -224,6 +240,8 @@ def apply_tick(conn: sqlite3.Connection, report: dict[str, Any], *, author: str 
                 continue
             kb.block_task(conn, root_id, reason="capability: verify workspace/repository route", kind="capability")
             root = kb.get_task(conn, root_id)
+        if _active_resolver_id(conn, root_id) is not None:
+            continue
         purpose = _resolver_purpose(conn, root_id, reason)
         key = kb.blocked_root_resolver_idempotency_key(root_id, purpose)
         existing = conn.execute("SELECT id, status FROM tasks WHERE idempotency_key = ?", (key,)).fetchone()
@@ -231,7 +249,9 @@ def apply_tick(conn: sqlite3.Connection, report: dict[str, Any], *, author: str 
             continue
         resolver_ids.append(kb.create_task(
             conn, title=f"Resolve gate: {root.title}",
-            body=("Verify this specific changed condition before resolving the root: " + reason),
+            body=("Verify this specific changed condition before resolving the root: " + reason
+                  + f"\n\nBefore completing, @{root.assignee} must post `[changed-condition] <specific evidence>` "
+                    f"on root {root_id}. Without that owner receipt, this gate cannot retry."),
             assignee=root.assignee, priority=max(90, int(escalation.get("effective_priority") or 0)),
             created_by=author, creator_task_id=root_id,
             blocked_root_resolver_for=root_id, blocked_root_resolver_purpose=purpose,
