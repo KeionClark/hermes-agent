@@ -455,6 +455,16 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "exists, return that task's id instead of creating "
                 "a duplicate. Useful for retry-safe automation."
         )),
+        "blocked_root_resolver_for": _prop("string", (
+                "Only for a worker-created changed-condition resolver below a blocked "
+                "needs-input/capability root. Set it to that exact root task id and pair "
+                "it with blocked_root_resolver_purpose and idempotency_key "
+                "blocked-root-resolver:<root-id>:<purpose>."
+        )),
+        "blocked_root_resolver_purpose": _prop("string", (
+                "Concrete changed condition being verified by a blocked-root resolver. "
+                "Do not use for speculative downstream work."
+        )),
         "max_runtime_seconds": _prop("integer", (
                 "Per-task runtime cap. When exceeded, the "
                 "dispatcher SIGTERMs the worker and re-queues the "

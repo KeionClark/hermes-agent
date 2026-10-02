@@ -112,6 +112,10 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
+# A worker may create a bounded resolver after an operator-facing root is
+# blocked, but it must name the changed condition and be replay-safe.
+BLOCKED_ROOT_ADMISSION_KINDS = frozenset({"needs_input", "capability"})
+
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
@@ -1279,6 +1283,8 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    blocked_root_resolver_for: Optional[str] = None,
+    blocked_root_resolver_purpose: Optional[str] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1332,6 +1338,8 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
+    resolver_for = (blocked_root_resolver_for or "").strip() or None
+    resolver_purpose = _normalize_blocked_root_resolver_purpose(blocked_root_resolver_purpose)
 
     now = int(time.time())
 
@@ -1356,6 +1364,11 @@ def create_task(
                     ).fetchone()
                     if row:
                         return row["id"]
+                _enforce_blocked_root_admission(
+                    conn, parents=parents, creator_task_id=creator_task_id, created_by=created_by,
+                    resolver_for=resolver_for, resolver_purpose=resolver_purpose,
+                    idempotency_key=idempotency_key,
+                )
                 task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
@@ -1407,6 +1420,8 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "blocked_root_resolver": ({"root": resolver_for, "purpose": resolver_purpose}
+                                                  if resolver_for else None),
                     },
                 )
                 if task_status == "blocked":
@@ -1449,6 +1464,87 @@ def create_task(
             if attempt == 1:
                 raise
     raise RuntimeError("unreachable")
+
+
+def _normalize_blocked_root_resolver_purpose(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    purpose = " ".join(str(value).split())
+    if not purpose:
+        raise ValueError("blocked_root_resolver_purpose must not be blank")
+    if len(purpose) > 160:
+        raise ValueError("blocked_root_resolver_purpose must be at most 160 characters")
+    return purpose
+
+
+def blocked_root_resolver_idempotency_key(root_task_id: str, purpose: str) -> str:
+    root = (root_task_id or "").strip()
+    normalized = _normalize_blocked_root_resolver_purpose(purpose)
+    if not root or normalized is None:
+        raise ValueError("blocked root id and resolver purpose are required")
+    return f"blocked-root-resolver:{root}:{normalized}"
+
+
+def _blocked_admission_ancestors(conn: sqlite3.Connection, seed_task_ids: Iterable[str]) -> list[str]:
+    seeds = tuple(dict.fromkeys(str(t).strip() for t in seed_task_ids if t and str(t).strip()))
+    if not seeds:
+        return []
+    placeholders = ",".join("?" * len(seeds))
+    rows = conn.execute(
+        f"""
+        WITH RECURSIVE upstream(id) AS (
+            SELECT id FROM tasks WHERE id IN ({placeholders})
+            UNION
+            SELECT links.parent_id FROM task_links AS links JOIN upstream ON links.child_id = upstream.id
+        )
+        SELECT DISTINCT tasks.id FROM tasks JOIN upstream ON upstream.id = tasks.id
+         WHERE tasks.status = 'blocked'
+           AND tasks.block_kind IN ({','.join('?' * len(BLOCKED_ROOT_ADMISSION_KINDS))})
+         ORDER BY tasks.id
+        """,
+        (*seeds, *sorted(BLOCKED_ROOT_ADMISSION_KINDS)),
+    ).fetchall()
+    return [str(row["id"]) for row in rows]
+
+
+def _is_automatic_task_creation(created_by: Optional[str], creator_task_id: Optional[str]) -> bool:
+    if creator_task_id:
+        return True
+    return (created_by or "").strip().casefold() in {
+        "decomposer", "swarm-orchestrator", "auto-decompose", "dispatcher",
+    }
+
+
+def _enforce_blocked_root_admission(
+    conn: sqlite3.Connection, *, parents: Iterable[str], creator_task_id: Optional[str],
+    created_by: Optional[str], resolver_for: Optional[str], resolver_purpose: Optional[str],
+    idempotency_key: Optional[str],
+) -> None:
+    if not _is_automatic_task_creation(created_by, creator_task_id):
+        return
+    blocked_roots = _blocked_admission_ancestors(conn, (*parents, creator_task_id or ""))
+    if not blocked_roots:
+        return
+    if not resolver_for or not resolver_purpose:
+        raise ValueError(
+            "worker task creation rejected: blocked needs_input/capability ancestor "
+            + ", ".join(blocked_roots)
+            + "; create a changed-condition resolver with blocked_root_resolver_for, "
+            "blocked_root_resolver_purpose, and its canonical idempotency key"
+        )
+    if resolver_for not in blocked_roots:
+        raise ValueError(
+            "blocked_root_resolver_for must name a blocked needs_input/capability ancestor: "
+            + ", ".join(blocked_roots)
+        )
+    if len(blocked_roots) != 1:
+        raise ValueError(
+            "changed-condition resolver crosses multiple blocked roots; create one resolver per root: "
+            + ", ".join(blocked_roots)
+        )
+    expected_key = blocked_root_resolver_idempotency_key(resolver_for, resolver_purpose)
+    if idempotency_key != expected_key:
+        raise ValueError("changed-condition resolver requires idempotency_key " + repr(expected_key))
 
 
 def _board_meta_for(board: Optional[str]) -> dict:
