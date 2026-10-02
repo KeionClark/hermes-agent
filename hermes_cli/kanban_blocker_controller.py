@@ -284,7 +284,7 @@ def apply_tick(conn: sqlite3.Connection, report: dict[str, Any], *, author: str 
 
 
 def systemd_units() -> dict[str, str]:
-    """Installable, bounded 15-minute controller units; returned for review first."""
+    """Installable, bounded two-minute controller units; returned for review first."""
     return {
         "service": """[Unit]
 Description=Hermes Kanban blocker controller
@@ -297,7 +297,7 @@ ExecStart=/var/lib/hermes/.local/bin/hermes --run-module hermes_cli.kanban_block
 NoNewPrivileges=true
 """,
         "timer": """[Unit]
-Description=Run Hermes Kanban blocker controller every 15 minutes
+Description=Run Hermes Kanban blocker controller every 2 minutes
 
 [Timer]
 OnBootSec=2m
