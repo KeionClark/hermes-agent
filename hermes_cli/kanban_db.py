@@ -4318,6 +4318,8 @@ def _checkpoint_task_locked(
     expected_run_id: int, metadata: Optional[dict] = None,
 ) -> tuple[bool, bool]:
     """``checkpoint_task`` body for callers that already hold ``write_txn``."""
+    if metadata is None and has_pending_fresh_process_checkpoint(conn, task_id):
+        return False, False
     now = int(time.time())
     row = conn.execute(
         "SELECT status, current_run_id, continuation_count, block_kind, block_recurrences "
@@ -4420,7 +4422,11 @@ def opt_in_fresh_process_checkpoint(conn: sqlite3.Connection, task_id: str) -> b
 
 
 def has_pending_fresh_process_checkpoint(conn: sqlite3.Connection, task_id: str) -> bool:
-    return conn.execute("SELECT 1 FROM fresh_process_checkpoints WHERE task_id = ?", (task_id,)).fetchone() is not None
+    return conn.execute(
+        "SELECT 1 FROM fresh_process_checkpoints p JOIN tasks t ON t.id = p.task_id "
+        "WHERE p.task_id = ? AND t.status = 'running' AND t.current_run_id = p.run_id",
+        (task_id,),
+    ).fetchone() is not None
 
 
 def stage_fresh_process_checkpoint(

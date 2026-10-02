@@ -673,10 +673,11 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.worker_started_at, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
-        "       t.max_runtime_seconds, t.claim_lock "
+        "       COALESCE(t.max_runtime_seconds, 2700) AS max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
+        "WHERE t.status = 'running' AND (t.max_runtime_seconds IS NOT NULL "
+        "  OR EXISTS (SELECT 1 FROM fresh_process_checkpoints p WHERE p.task_id = t.id)) "
         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
         "  AND t.worker_pid IS NOT NULL"
     ).fetchall()
@@ -684,8 +685,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         lock = row["claim_lock"] or ""
         if not lock.startswith(host_prefix):
             continue
-        if _kb.has_pending_fresh_process_checkpoint(conn, row["id"]):
-            continue
+        pending_handoff = _kb.has_pending_fresh_process_checkpoint(conn, row["id"])
         # Runtime is per attempt: ``tasks.started_at`` records the FIRST start,
         # so retries must be measured from the active task_runs row.
         elapsed = now - int(row["active_started_at"])
@@ -714,6 +714,18 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
             _poll_worker_exit(pid, started_at)
             if _worker_alive(pid, started_at):
                 killed = _sigkill(kill, pid)
+
+        if pending_handoff:
+            if _worker_alive(pid, started_at):
+                continue
+            with _kb.write_txn(conn):
+                run_id = _kb._current_run_id(conn, tid)
+                if run_id is not None and _kb.has_pending_fresh_process_checkpoint(conn, tid):
+                    _kb.reject_fresh_process_checkpoint_locked(
+                        conn, tid, run_id=run_id, reason=f"worker exceeded max runtime ({int(elapsed)}s)",
+                    )
+                    timed_out.append(tid)
+            continue
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
         with _kb.write_txn(conn):
@@ -2340,6 +2352,11 @@ def _run_reclaim_phase(
     result.reaped_terminal_workers = reap_terminal_workers(conn)
     # Settle or hold staged handoffs before any ordinary reclaim can requeue them.
     with _kb.write_txn(conn):
+        conn.execute(
+            "DELETE FROM fresh_process_checkpoints WHERE NOT EXISTS ("
+            "SELECT 1 FROM tasks t WHERE t.id = fresh_process_checkpoints.task_id "
+            "AND t.status = 'running' AND t.current_run_id = fresh_process_checkpoints.run_id)"
+        )
         pending = conn.execute(
             "SELECT p.task_id, p.run_id FROM fresh_process_checkpoints p "
             "LEFT JOIN tasks t ON t.id = p.task_id "

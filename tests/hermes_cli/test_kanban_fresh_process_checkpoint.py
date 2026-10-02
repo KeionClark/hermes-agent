@@ -174,7 +174,7 @@ def test_pending_handoff_cannot_requeue_on_expired_lease(kanban_home, tmp_path, 
             "summary": "saved", "next_step": "continue", "external_actions": [],
         }, delay_seconds=1, expected_run_id=run_id, workspace=str(repo))
         with kb.write_txn(conn):
-            conn.execute("UPDATE tasks SET claim_expires = ?, max_runtime_seconds = 1 WHERE id = ?",
+            conn.execute("UPDATE tasks SET claim_expires = ?, max_runtime_seconds = 3600 WHERE id = ?",
                          (int(time.time()) - 2, tid))
         monkeypatch.setattr(kb, "_worker_alive", lambda *_: False)
         assert kb.release_stale_claims(conn) == 0
@@ -184,6 +184,45 @@ def test_pending_handoff_cannot_requeue_on_expired_lease(kanban_home, tmp_path, 
         kbd.detect_crashed_workers(conn)
         assert kb.get_task(conn, tid).status == "blocked"
         assert kb.recompute_ready(conn) == 0
+
+
+def test_pending_handoff_runtime_kills_and_holds_worker(kanban_home, tmp_path, monkeypatch):
+    repo = _repo(tmp_path / "repo")
+    with kbc.connect() as conn:
+        tid, run_id = _claimed(conn, repo)
+        assert kb.stage_fresh_process_checkpoint(conn, tid, handoff={
+            "summary": "saved", "next_step": "continue", "external_actions": [],
+        }, delay_seconds=1, expected_run_id=run_id, workspace=str(repo))
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET max_runtime_seconds = 1 WHERE id = ?", (tid,))
+            conn.execute("UPDATE task_runs SET started_at = ? WHERE id = ?",
+                         (int(time.time()) - 10, run_id))
+        live = {"value": True}
+        signals = []
+        monkeypatch.setattr(kb, "_pid_alive", lambda *_: live["value"])
+        monkeypatch.setattr(kbd, "_pid_recycled", lambda *_: False)
+        monkeypatch.setattr(kbd, "_worker_alive", lambda *_: live["value"])
+        def signal_worker(pid, sig):
+            signals.append((pid, sig))
+            live["value"] = False
+        assert kbd.enforce_max_runtime(conn, signal_fn=signal_worker) == [tid]
+        assert signals
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.recompute_ready(conn) == 0
+
+
+def test_ordinary_checkpoint_cannot_strand_pending_handoff(kanban_home, tmp_path):
+    repo = _repo(tmp_path / "repo")
+    with kbc.connect() as conn:
+        tid, run_id = _claimed(conn, repo)
+        assert kb.stage_fresh_process_checkpoint(conn, tid, handoff={
+            "summary": "saved", "next_step": "continue", "external_actions": [],
+        }, delay_seconds=1, expected_run_id=run_id, workspace=str(repo))
+        assert kb.checkpoint_task(conn, tid, summary="ordinary", expected_run_id=run_id) == (False, False)
+        assert kb.get_task(conn, tid).status == "running"
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='scheduled', current_run_id=NULL WHERE id=?", (tid,))
+        assert not kb.has_pending_fresh_process_checkpoint(conn, tid)
 
 
 def test_pending_handoff_is_held_across_orphan_and_stale_reclaim(kanban_home, tmp_path, monkeypatch):
