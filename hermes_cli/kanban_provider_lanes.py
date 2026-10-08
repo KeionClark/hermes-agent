@@ -126,13 +126,22 @@ class LaneLedger:
             owner TEXT NOT NULL, worker TEXT, created_at REAL NOT NULL,
             observed_provider TEXT, observed_model TEXT,
             UNIQUE(board, task, run))""")
+        self.conn.execute("""CREATE TABLE IF NOT EXISTS runtime_observations (
+            id INTEGER PRIMARY KEY, token TEXT NOT NULL, board TEXT NOT NULL,
+            task TEXT NOT NULL, run INTEGER NOT NULL, worker TEXT NOT NULL,
+            requested_provider TEXT NOT NULL, requested_model TEXT NOT NULL,
+            observed_provider TEXT NOT NULL, observed_model TEXT NOT NULL,
+            observed_at REAL NOT NULL)""")
 
     def close(self) -> None:
         self.conn.close()
 
     def reserve(self, *, board: str, task: str, run: int,
                 candidates: Sequence[Candidate], owner: str,
-                alive: Callable[[Mapping], bool | None]) -> tuple[str, Candidate] | None:
+                alive: Callable[[Mapping], bool | None],
+                memory_sample: Callable[[], int | None] | None = None,
+                minimum_free_bytes: int = 2 * 1024**3,
+                worker_headroom_bytes: int = 512 * 1024**2) -> tuple[str, Candidate] | None:
         """Reserve the first available ordered lane; never overwrite an owner."""
         if not owner or not board or not task or type(run) is not int:
             raise ValueError("reservation requires board, task, run and owner")
@@ -144,10 +153,26 @@ class LaneLedger:
                 if alive(dict(row)) is False:
                     self.conn.execute("DELETE FROM reservations WHERE token = ?", (row["token"],))
             rows = self.conn.execute("SELECT * FROM reservations").fetchall()
+            # A worker executing on the wrong backend cannot keep charging its
+            # requested lane. Quarantine host admission until it physically exits.
+            if self.conn.execute("""SELECT 1 FROM runtime_observations AS o
+                JOIN reservations AS r ON r.token = o.token
+                WHERE o.observed_provider != o.requested_provider LIMIT 1""").fetchone():
+                return None
             if any((r["board"], r["task"], r["run"]) == (board, task, run) for r in rows):
                 return None
             if len(rows) >= TOTAL_CAP:
                 return None
+            if memory_sample is not None:
+                if (type(minimum_free_bytes) is not int or minimum_free_bytes <= 0
+                        or type(worker_headroom_bytes) is not int or worker_headroom_bytes <= 0):
+                    raise ValueError("positive memory threshold and per-worker headroom required")
+                # Charge every reservation, even pending spawns: OS metrics can
+                # lag allocations and concurrent boards must not spend one sample
+                # repeatedly. Deliberately conservative for already-live workers.
+                threshold = minimum_free_bytes + (len(rows) + 1) * worker_headroom_bytes
+                if not memory_admits(memory_sample(), threshold):
+                    return None
             for candidate in candidates:
                 if sum(r["requested_provider"] == candidate.provider for r in rows) >= LANE_CAP:
                     continue
@@ -168,23 +193,61 @@ class LaneLedger:
     def bind_worker(self, token: str, owner: str, worker: str) -> bool:
         if not worker:
             raise ValueError("worker fingerprint required")
-        return self.conn.execute("UPDATE reservations SET worker = ? WHERE token = ? AND owner = ?",
-                                 (worker, token, owner)).rowcount == 1
+        return self.conn.execute("""UPDATE reservations SET worker = ?
+            WHERE token = ? AND owner = ? AND (worker IS NULL OR worker = ?)""",
+            (worker, token, owner, worker)).rowcount == 1
 
     def observe(self, token: str, worker: str, *, provider: str, model: str) -> bool:
         """Store real runtime evidence separately, including a route mismatch.
 
         The caller must pass observations from the executing runtime, never
-        config/argv. Observation cannot change the capacity-charged lane.
+        config/argv. A provider mismatch quarantines further admission until
+        the worker exits. Append-only evidence survives reservation release.
         """
         if not provider or not model or not worker:
             raise ValueError("runtime provider/model and worker identity required")
-        return self.conn.execute("""UPDATE reservations SET observed_provider = ?, observed_model = ?
-            WHERE token = ? AND worker = ?""", (provider, model, token, worker)).rowcount == 1
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            recorded = self.conn.execute("""INSERT INTO runtime_observations
+                (token, board, task, run, worker, requested_provider, requested_model,
+                 observed_provider, observed_model, observed_at)
+                SELECT token, board, task, run, worker, requested_provider, requested_model, ?, ?, ?
+                FROM reservations WHERE token = ? AND worker = ?""",
+                (provider, model, time.time(), token, worker)).rowcount == 1
+            if recorded:
+                self.conn.execute("""UPDATE reservations SET observed_provider = ?, observed_model = ?
+                    WHERE token = ? AND worker = ?""", (provider, model, token, worker))
+            self.conn.commit()
+            return recorded
+        except BaseException:
+            self.conn.rollback()
+            raise
 
-    def release(self, token: str, owner: str) -> bool:
-        return self.conn.execute("DELETE FROM reservations WHERE token = ? AND owner = ?",
-                                 (token, owner)).rowcount == 1
+    def observations(self, *, board: str, task: str, run: int) -> list[dict]:
+        return [dict(row) for row in self.conn.execute("""SELECT * FROM runtime_observations
+            WHERE board = ? AND task = ? AND run = ? ORDER BY id""", (board, task, run))]
+
+    def release(self, token: str, owner: str, *,
+                alive: Callable[[Mapping], bool | None] | None = None) -> bool:
+        """Cancel a pending spawn, or release a proved-dead bound worker.
+
+        Pending cancellation is only valid before attempting spawn. After a
+        spawn might have happened the caller must retain the slot for recovery.
+        A terminal task state is never proof a physical worker has exited.
+        """
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute("SELECT * FROM reservations WHERE token = ? AND owner = ?",
+                                    (token, owner)).fetchone()
+            if row is None or (row["worker"] and (alive is None or alive(dict(row)) is not False)):
+                self.conn.commit()
+                return False
+            self.conn.execute("DELETE FROM reservations WHERE token = ? AND owner = ?", (token, owner))
+            self.conn.commit()
+            return True
+        except BaseException:
+            self.conn.rollback()
+            raise
 
     def snapshot(self) -> list[dict]:
         return [dict(row) for row in self.conn.execute("SELECT * FROM reservations")]
