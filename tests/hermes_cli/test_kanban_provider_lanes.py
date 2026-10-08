@@ -161,7 +161,7 @@ def test_real_runtime_mismatch_is_separate_from_requested(tmp_path):
         assert not ledger.observe(token, "impostor", provider="openai-codex", model="actual-model")
         assert ledger.observe(token, "worker-fingerprint", provider="openai-codex", model="actual-model")
         row = ledger.snapshot()[0]
-        assert (row["provider"], row["requested_model"]) == ("anthropic", "claude-fixture")
+        assert (row["requested_provider"], row["requested_model"]) == ("anthropic", "claude-fixture")
         assert (row["observed_provider"], row["observed_model"]) == ("openai-codex", "actual-model")
     finally:
         ledger.close()
