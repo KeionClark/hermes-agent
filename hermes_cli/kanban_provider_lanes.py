@@ -122,7 +122,7 @@ class LaneLedger:
         self.conn.execute("PRAGMA busy_timeout = 30000")
         self.conn.execute("""CREATE TABLE IF NOT EXISTS reservations (
             token TEXT PRIMARY KEY, board TEXT NOT NULL, task TEXT NOT NULL,
-            run INTEGER NOT NULL, provider TEXT NOT NULL, requested_model TEXT NOT NULL,
+            run INTEGER NOT NULL, requested_provider TEXT NOT NULL, requested_model TEXT NOT NULL,
             owner TEXT NOT NULL, worker TEXT, created_at REAL NOT NULL,
             observed_provider TEXT, observed_model TEXT,
             UNIQUE(board, task, run))""")
@@ -149,11 +149,11 @@ class LaneLedger:
             if len(rows) >= TOTAL_CAP:
                 return None
             for candidate in candidates:
-                if sum(r["provider"] == candidate.provider for r in rows) >= LANE_CAP:
+                if sum(r["requested_provider"] == candidate.provider for r in rows) >= LANE_CAP:
                     continue
                 token = uuid.uuid4().hex
                 self.conn.execute("""INSERT INTO reservations
-                    (token, board, task, run, provider, requested_model, owner, created_at)
+                    (token, board, task, run, requested_provider, requested_model, owner, created_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                     (token, board, task, run, candidate.provider, candidate.model, owner, time.time()))
                 return token, candidate
