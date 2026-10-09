@@ -18,6 +18,7 @@ LEGACY_VERCEL_RUNTIME = "node24"  # the seeded pre-49 default, never a user choi
 
 
 from hermes_cli.config_defaults_auxiliary import aux_block
+from hermes_cli.config_defaults_kanban import dispatch_defaults
 
 
 DEFAULT_CONFIG = {
@@ -1891,13 +1892,7 @@ DEFAULT_CONFIG = {
         "dispatch_interval_seconds": 60,
         # Opt-in scheduling diagnostics; does not activate provider lanes or
         # change concurrency caps. Reports are durable task events, not sends.
-        "dispatch_scheduling": {
-            "enabled": False,
-            "aging_seconds": 900,
-            "maximum_bonus": 20,
-            "stall_seconds": 3600,
-            "oldest_limit": 10,
-        },
+        **dispatch_defaults(),
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,
         # crashed) for the same task/profile. Reassignment resets the streak.
         "failure_limit": 2,

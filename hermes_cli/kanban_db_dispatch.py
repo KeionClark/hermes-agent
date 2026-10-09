@@ -1969,6 +1969,7 @@ def dispatch_once(
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
     dispatch_scheduling: Optional[Mapping[str, Any]] = None,
+    provider_lanes: Optional[Mapping[str, Any]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -1979,7 +1980,8 @@ def dispatch_once(
     resolved DB path so unrelated boards tick in parallel.
     """
     def _locked_tick() -> DispatchResult:
-        return _dispatch_once_locked(
+        from hermes_cli.kanban_lane_coordinator import with_settings
+        return with_settings(provider_lanes, _dispatch_once_locked,
             conn,
             spawn_fn=spawn_fn,
             ttl_seconds=ttl_seconds,
@@ -2115,7 +2117,7 @@ def _dispatch_lane_task(
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
         from hermes_cli.kanban_db_dispatch_spawn import call_spawn_fn
-        pid = call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
+        pid = call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board, conn=conn)
         if pid:
             _set_worker_pid(conn, claimed.id, int(pid))
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
@@ -2128,10 +2130,16 @@ def _dispatch_lane_task(
         return True
     except Exception as exc:
         from tools.process_registry import RestartSafeScopeUnavailable
+        from hermes_cli.kanban_lane_coordinator import LaneDeferred, LaneSpawnUncertain
+        if isinstance(exc, LaneSpawnUncertain):
+            with _kb.write_txn(conn):
+                _kb._append_event(conn, claimed.id, "lane_spawn_uncertain", {}, run_id=claimed.current_run_id)
+            _count_spawn(claimed.assignee)
+            return True
 
         # The host refused the spawn (no restart-safe scope): nothing about the
         # card ran, so it must not spend the card's retry budget (#114720).
-        infrastructure = isinstance(exc, RestartSafeScopeUnavailable)
+        infrastructure = isinstance(exc, (RestartSafeScopeUnavailable, LaneDeferred))
         if infrastructure:
             _kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s", claimed.id, exc)
         if _record_task_failure(
@@ -2143,35 +2151,9 @@ def _dispatch_lane_task(
         return False
 
 
-def _apply_default_assignee(
-    conn: sqlite3.Connection, task_id: str, assignee: str, *, dry_run: bool,
-) -> bool:
-    """Persist ``kanban.default_assignee`` on an unassigned ready row.
-
-    Mutating the row keeps board state honest: the task is legitimately owned
-    by the default, not "unassigned but secretly routed". ``dry_run`` reports
-    without writing. Returns False when the write failed.
-    """
-    if dry_run:
-        return True
-    try:
-        with _kb.write_txn(conn):
-            conn.execute(
-                "UPDATE tasks SET assignee = ? WHERE id = ? "
-                "AND (assignee IS NULL OR assignee = '')",
-                (assignee, task_id),
-            )
-            _kb._append_event(
-                conn, task_id, "assigned",
-                {"assignee": assignee, "source": "kanban.default_assignee"},
-            )
-    except Exception:
-        _kb._log.debug(
-            "kanban dispatch: failed to apply default_assignee=%r to task %s",
-            assignee, task_id, exc_info=True,
-        )
-        return False
-    return True
+def _apply_default_assignee(conn, task_id, assignee, *, dry_run):
+    from hermes_cli.kanban_db_dispatch_assignment import apply_default_assignee
+    return apply_default_assignee(conn, task_id, assignee, dry_run=dry_run)
 
 
 def _run_reclaim_phase(
