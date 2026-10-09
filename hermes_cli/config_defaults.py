@@ -5,6 +5,9 @@ docs of config.yaml.
 """
 
 
+from hermes_cli.config_defaults_kanban import dispatch_defaults
+
+
 def _aux(timeout, *, reasoning_effort=True, **extra):
     """Standard auxiliary-task model block (see DEFAULT_CONFIG["auxiliary"]).
 
@@ -1877,6 +1880,8 @@ DEFAULT_CONFIG = {
         "review_dispatch": True,
         # Seconds between dispatcher ticks. Lower = snappier pickup; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
+        # Opt-in scheduling diagnostics and provider lanes; both default off.
+        **dispatch_defaults(),
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,
         # crashed) for the same task/profile. Reassignment resets the streak.
         "failure_limit": 2,
