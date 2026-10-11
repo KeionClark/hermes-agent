@@ -51,9 +51,15 @@ def load_router(path: Path) -> dict[str, tuple[Candidate, ...]]:
     with path.open("rb") as stream:
         data = tomllib.load(stream)
     routes = {}
-    for stage, section in data.get("stages", {}).items():
+    stages = data.get("stages", {})
+    if not isinstance(stages, dict):
+        raise ValueError("router stages must be a table")
+    for stage, section in stages.items():
+        rows = section.get("candidates", []) if isinstance(section, dict) else None
+        if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+            raise ValueError(f"malformed route shape in stage {stage}")
         candidates = []
-        for row in section.get("candidates", []):
+        for row in rows:
             provider = provider_lane(row.get("provider", ""))
             model = row.get("model")
             if not provider or not isinstance(model, str) or not model.strip():

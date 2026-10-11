@@ -190,3 +190,28 @@ def test_terminal_card_retains_slot_until_real_child_exits(board, monkeypatch):
 def test_invalid_enabled_setting_fails_closed(value):
     with pytest.raises(coordinator.LaneDeferred):
         coordinator.resolve_settings({"enabled": value})
+
+
+@pytest.mark.parametrize("contents", [
+    "[stages]\nbuild = 1\n",
+    "stages = 3\n",
+    "[stages.build]\ncandidates = [1]\n",
+    "[stages.build]\ncandidates = 5\n",
+])
+def test_structurally_invalid_router_defers_without_spending_failure_budget(board, contents):
+    conn, settings = board
+    Path(settings["router_path"]).write_text(contents)
+    tid = task(conn)
+    calls = []
+    assert not tick(conn, settings, lambda *args: calls.append(args)).spawned
+    current = kb.get_task(conn, tid)
+    assert current.status == "ready" and current.claim_lock is None
+    assert current.consecutive_failures == 0 and not calls and snapshot() == []
+
+
+def test_valid_router_pin_control_still_spawns(board):
+    conn, settings = board
+    task(conn)
+    calls = []
+    tick(conn, settings, lambda *args: calls.append(args))
+    assert len(calls) == 1
