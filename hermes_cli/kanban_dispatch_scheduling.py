@@ -57,7 +57,7 @@ def queue_rows(conn, status: str, settings: SchedulingSettings, *, now: float | 
         "SELECT id, assignee, priority, created_at FROM tasks "
         "WHERE status = ? AND claim_lock IS NULL "
         "AND LOWER(TRIM(COALESCE(tenant, ''))) != ? "  # 'mac' = Mac overflow worker, not server-owned
-        "ORDER BY priority DESC, created_at ASC, id ASC",
+        "ORDER BY priority DESC, created_at ASC, rowid ASC",
         (status, "mac"),
     ).fetchall()
     if not settings.enabled:
